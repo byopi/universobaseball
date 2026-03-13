@@ -33,6 +33,11 @@ CHANNEL_WBC    = os.environ.get("CHANNEL_WBC",    "") or CHANNEL_ID
 
 SUBSCRIBE_LINE = "<i>⚾️ Suscribete en t.me/UniversoBaseball</i>"
 VIDEOS_LINE    = "🎦 <b>Todos los videos del juego en: @homerunsmlb / @ubvideos</b>"
+GAMES_TODAY_GIF = (
+    "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEjXxAzGsrFLFoVAQz-TbKEUpko0U2QhpGWF0EiksuZ_"
+    "sxciC2yS1v6ilCzz9HHvzLfOH9-MKUgASBOAMzVfuduR-Ww_UzYAlNPI9RZju1rmR4DxpURoNkmg8naEHuPABgsQd2jkk3Bq"
+    "Tlb3HzbgEDtRJuioYg6R1Vy4Nwiaw-PoUmimdenyfebBnOW17N4/w665-h443/juegos-de-hoy.gif"
+)
 
 _sent_results: set = set()
 _sent_lineups: set = set()
@@ -141,12 +146,12 @@ async def _send_message(bot: Bot, chat_id: str, text: str):
 
 
 # ─────────────────────────────────────────────────────────────
-#  FORMATO 1: JUEGOS DEL DÍA
+#  FORMATO 1: JUEGOS DEL DÍA — GIF + texto con nombres completos
 #  🍿 ¡JUEGOS DE HOY! ⚾️
 #
 #  🇺🇸 | MLB (bold)
 #
-#  Yankees - Red Sox  19:05
+#  New York Yankees - Boston Red Sox  19:05
 #  ...
 #
 #  ⚾️ Suscribete en t.me/UniversoBaseball (italic)
@@ -157,7 +162,6 @@ async def publish_games_today(bot: Bot, league: str, games: list,
         return
 
     display = _parse_games_for_display(games, league)
-    image_bytes = await ig.generate_games_today_image(display, league, date_str, league_logo_url)
 
     league_headers = {
         "mlb":    "🇺🇸 | <b>MLB</b>",
@@ -174,13 +178,25 @@ async def publish_games_today(bot: Bot, league: str, games: list,
     ]
 
     for g in display:
-        away = g["away_abbr"] or g["away_name"]
-        home = g["home_abbr"] or g["home_name"]
+        # Siempre nombre completo, nunca abreviación
+        away = g["away_name"]
+        home = g["home_name"]
         lines.append(f"{away} - {home}  {g['time']}")
 
     lines += ["", SUBSCRIBE_LINE]
 
-    await _send_photo(bot, _channel_for(league), image_bytes, "\n".join(lines))
+    caption = "\n".join(lines)
+    channel = _channel_for(league)
+    try:
+        await bot.send_animation(
+            chat_id=channel,
+            animation=GAMES_TODAY_GIF,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.error(f"Error enviando GIF juegos del día a {channel}: {e}")
+
     logger.info(f"[{league.upper()}] Juegos del día publicados: {len(display)}")
 
 
@@ -451,10 +467,7 @@ async def run_scheduler(bot: Bot):
                 if last_date_published != today_str:
                     mlb_games = await df.get_mlb_games(session, today_str)
                     if mlb_games:
-                        await publish_games_today(
-                            bot, "mlb", mlb_games, date_display,
-                            "https://www.mlbstatic.com/team-logos/league-on-dark/1.svg"
-                        )
+                        await publish_games_today(bot, "mlb", mlb_games, date_display)
                         await asyncio.sleep(3)
 
                     lvbp_games = await df.get_lvbp_games(session, today_str)
@@ -557,8 +570,8 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 home  = df.get_team_info(g, "home")
                 t     = df.get_game_time_str(g, tz)
                 state = g.get("status", {}).get("abstractGameState", "")
-                ad    = away["abbreviation"] or away["name"]
-                hd    = home["abbreviation"] or home["name"]
+                ad = away["name"]
+                hd = home["name"]
                 if state == "Final":
                     lines.append(f"✅ {ad} <b>{away['score']}</b>-<b>{home['score']}</b> {hd}")
                 elif state == "Live":
@@ -592,8 +605,15 @@ async def cmd_hoy_mlb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         games = await df.get_mlb_games(session, today_str)
     if games:
         display = _parse_games_for_display(games, "mlb")
-        img = await ig.generate_games_today_image(display, "mlb", date_display)
-        await update.message.reply_photo(io.BytesIO(img))
+        lines = ["🍿 ¡JUEGOS DE HOY! ⚾️", "", "🇺🇸 | <b>MLB</b>", ""]
+        for g in display:
+            lines.append(f"{g['away_name']} - {g['home_name']}  {g['time']}")
+        lines += ["", SUBSCRIBE_LINE]
+        await update.message.reply_animation(
+            animation=GAMES_TODAY_GIF,
+            caption="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
     else:
         await update.message.reply_text("No hay juegos MLB hoy.")
 
@@ -605,8 +625,15 @@ async def cmd_hoy_lvbp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         games = await df.get_lvbp_games(session, today_str)
     if games:
         display = _parse_games_for_display(games, "lvbp")
-        img = await ig.generate_games_today_image(display, "lvbp", date_display)
-        await update.message.reply_photo(io.BytesIO(img))
+        lines = ["🍿 ¡JUEGOS DE HOY! ⚾️", "", "🇻🇪 | <b>LVBP Venezuela</b>", ""]
+        for g in display:
+            lines.append(f"{g['away_name']} - {g['home_name']}  {g['time']}")
+        lines += ["", SUBSCRIBE_LINE]
+        await update.message.reply_animation(
+            animation=GAMES_TODAY_GIF,
+            caption="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
     else:
         await update.message.reply_text("No hay juegos LVBP hoy.")
 
