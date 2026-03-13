@@ -39,12 +39,10 @@ GAMES_TODAY_GIF = (
     "Tlb3HzbgEDtRJuioYg6R1Vy4Nwiaw-PoUmimdenyfebBnOW17N4/w665-h443/juegos-de-hoy.gif"
 )
 
-_sent_results: set = set()
-_sent_lineups: set = set()
-# Para MLB: acumular resultados del día hasta que todos estén listos
-_mlb_pending_results: dict = {}   # gamePk -> game_data dict
-_mlb_results_sent_today: bool = False
-_mlb_results_date: str = ""
+_sent_results:  set  = set()
+_sent_lineups:  set  = set()
+# Control de resultados bulk por liga: {league -> {"sent": bool, "date": str}}
+_bulk_state: dict = {}
 
 
 def _channel_for(league: str) -> str:
@@ -201,167 +199,40 @@ async def publish_games_today(bot: Bot, league: str, games: list,
 
 
 # ─────────────────────────────────────────────────────────────
-#  FORMATO 2: RESULTADO FINAL (LVBP / WBC / Caribe — uno por juego)
-#  📢 | FINAL DEL JUEGO (bold)
+#  FORMATO 2: TODOS LOS RESULTADOS DE UNA LIGA EN UN SOLO MENSAJE
+#  Espera a que terminen TODOS los juegos del día antes de publicar.
 #
-#  ↪️ Yankees 5-3 Red Sox
-#
-#  🎦 Todos los videos del juego en: @homerunsmlb / @ubvideos (bold)
-#
-#  ⚾️ Suscribete en t.me/UniversoBaseball (italic)
-# ─────────────────────────────────────────────────────────────
-async def publish_single_result(bot: Bot, game: dict, league: str,
-                                 session: aiohttp.ClientSession):
-    """Resultado individual — para LVBP, Caribe, WBC y MLB postseason."""
-    key = _game_key(game, f"result_{league}")
-    if key in _sent_results:
-        return
-    _sent_results.add(key)
-
-    game_pk = game.get("gamePk")
-    away = df.get_team_info(game, "away")
-    home = df.get_team_info(game, "home")
-
-    box = await df.get_game_boxscore(session, game_pk)
-    away_hits   = box.get("teams", {}).get("away", {}).get("teamStats", {}).get("batting",  {}).get("hits",   "-")
-    home_hits   = box.get("teams", {}).get("home", {}).get("teamStats", {}).get("batting",  {}).get("hits",   "-")
-    away_errors = box.get("teams", {}).get("away", {}).get("teamStats", {}).get("fielding", {}).get("errors", "-")
-    home_errors = box.get("teams", {}).get("home", {}).get("teamStats", {}).get("fielding", {}).get("errors", "-")
-
-    linescore = await df.get_game_linescore(session, game_pk)
-    innings = linescore.get("currentInning", 9)
-
-    decisions = game.get("decisions", {})
-    winner_p = decisions.get("winner", {}).get("fullName", "")
-    loser_p  = decisions.get("loser",  {}).get("fullName", "")
-    save_p   = decisions.get("save",   {}).get("fullName", "")
-
-    away_country = _country_from_team(away["name"])
-    home_country = _country_from_team(home["name"])
-
-    game_data = {
-        "away_name": away["name"], "home_name": home["name"],
-        "away_id":   away["id"] if not away_country else None,
-        "home_id":   home["id"] if not home_country else None,
-        "away_country": away_country, "home_country": home_country,
-        "away_score": away["score"], "home_score": home["score"],
-        "innings": innings,
-        "away_hits": away_hits, "home_hits": home_hits,
-        "away_errors": away_errors, "home_errors": home_errors,
-        "winner_pitcher": winner_p, "loser_pitcher": loser_p, "save_pitcher": save_p,
-    }
-
-    image_bytes = await ig.generate_final_result_image(game_data, league)
-
-    away_display = away["abbreviation"] or away["name"]
-    home_display = home["abbreviation"] or home["name"]
-
-    lines = [
-        "📢 | <b>FINAL DEL JUEGO</b>",
-        "",
-        f"↪️ {away_display} {away['score']}-{home['score']} {home_display}",
-    ]
-    if winner_p or loser_p:
-        lines.append("")
-        if winner_p: lines.append(f"✅ W: {winner_p}")
-        if loser_p:  lines.append(f"❌ L: {loser_p}")
-        if save_p:   lines.append(f"💾 S: {save_p}")
-
-    lines += [
-        "",
-        VIDEOS_LINE,
-        "",
-        SUBSCRIBE_LINE,
-    ]
-
-    await _send_photo(bot, _channel_for(league), image_bytes, "\n".join(lines))
-    logger.info(f"[{league.upper()}] Resultado: {away_display} {away['score']}-{home['score']} {home_display}")
-
-
-# ─────────────────────────────────────────────────────────────
-#  FORMATO 2 MLB: TODOS LOS RESULTADOS EN UN SOLO MENSAJE
 #  📢 | FINAL DEL JUEGO (bold)
 #
 #  ↪️ Yankees 5-3 Red Sox
 #  ↪️ Dodgers 7-2 Giants
 #  ...
 #
-#  🎦 Todos los videos del juego en: @homerunsmlb / @ubvideos (bold)
-#
-#  ⚾️ Suscribete en t.me/UniversoBaseball (italic)
+#  🎦 Todos los videos... (bold)
+#  ⚾️ Suscribete... (italic)
 # ─────────────────────────────────────────────────────────────
-async def publish_mlb_results_bulk(bot: Bot, games: list,
-                                    session: aiohttp.ClientSession):
-    """
-    Espera a que TODOS los juegos MLB del día estén finales
-    y publica todos los resultados en un solo mensaje con imagen.
-    """
-    global _mlb_results_sent_today, _mlb_results_date
+async def _build_game_data(game: dict, session: aiohttp.ClientSession) -> dict:
+    """Construye el dict game_data para generate_final_result_image."""
+    game_pk = game.get("gamePk")
+    away    = df.get_team_info(game, "away")
+    home    = df.get_team_info(game, "home")
 
-    today_str = date.today().strftime("%Y-%m-%d")
+    box       = await df.get_game_boxscore(session, game_pk)
+    linescore = await df.get_game_linescore(session, game_pk)
+    decisions = game.get("decisions", {})
 
-    # Reset si es un nuevo día
-    if _mlb_results_date != today_str:
-        _mlb_results_sent_today = False
-        _mlb_results_date = today_str
-        _mlb_pending_results.clear()
+    away_country = _country_from_team(away["name"])
+    home_country = _country_from_team(home["name"])
 
-    if _mlb_results_sent_today:
-        return
-
-    # Filtrar solo juegos de hoy que ya terminaron
-    final_games = [g for g in games if df.is_game_final(g)]
-    non_final   = [g for g in games if not df.is_game_final(g)
-                   and not df.is_game_postponed(g)]
-
-    # Si aún hay juegos en curso o por empezar, esperar
-    if non_final:
-        logger.info(f"[MLB] Esperando {len(non_final)} juego(s) restante(s) para publicar resultados")
-        return
-
-    if not final_games:
-        return
-
-    # Marcar como enviado
-    _mlb_results_sent_today = True
-
-    # Construir texto con todos los resultados
-    lines = [
-        "📢 | <b>FINAL DEL JUEGO</b>",
-        "",
-    ]
-
-    for game in final_games:
-        away = df.get_team_info(game, "away")
-        home = df.get_team_info(game, "home")
-        away_d = away["abbreviation"] or away["name"]
-        home_d = home["abbreviation"] or home["name"]
-        lines.append(f"↪️ {away_d} {away['score']}-{home['score']} {home_d}")
-
-    lines += [
-        "",
-        VIDEOS_LINE,
-        "",
-        SUBSCRIBE_LINE,
-    ]
-
-    # Usar el primer juego para generar imagen representativa
-    first_game = final_games[0]
-    away = df.get_team_info(first_game, "away")
-    home = df.get_team_info(first_game, "home")
-
-    box = await df.get_game_boxscore(session, first_game.get("gamePk"))
-    linescore = await df.get_game_linescore(session, first_game.get("gamePk"))
-    decisions = first_game.get("decisions", {})
-
-    game_data = {
+    return {
         "away_name": away["name"], "home_name": home["name"],
-        "away_id": away["id"], "home_id": home["id"],
-        "away_country": None, "home_country": None,
+        "away_id":   away["id"] if not away_country else None,
+        "home_id":   home["id"] if not home_country else None,
+        "away_country": away_country, "home_country": home_country,
         "away_score": away["score"], "home_score": home["score"],
         "innings": linescore.get("currentInning", 9),
-        "away_hits": box.get("teams", {}).get("away", {}).get("teamStats", {}).get("batting", {}).get("hits", "-"),
-        "home_hits": box.get("teams", {}).get("home", {}).get("teamStats", {}).get("batting", {}).get("hits", "-"),
+        "away_hits":   box.get("teams", {}).get("away", {}).get("teamStats", {}).get("batting",  {}).get("hits",   "-"),
+        "home_hits":   box.get("teams", {}).get("home", {}).get("teamStats", {}).get("batting",  {}).get("hits",   "-"),
         "away_errors": box.get("teams", {}).get("away", {}).get("teamStats", {}).get("fielding", {}).get("errors", "-"),
         "home_errors": box.get("teams", {}).get("home", {}).get("teamStats", {}).get("fielding", {}).get("errors", "-"),
         "winner_pitcher": decisions.get("winner", {}).get("fullName", ""),
@@ -369,9 +240,53 @@ async def publish_mlb_results_bulk(bot: Bot, games: list,
         "save_pitcher":   decisions.get("save",   {}).get("fullName", ""),
     }
 
-    image_bytes = await ig.generate_final_result_image(game_data, "mlb")
-    await _send_photo(bot, _channel_for("mlb"), image_bytes, "\n".join(lines))
-    logger.info(f"[MLB] Resultados bulk publicados: {len(final_games)} juegos finales")
+
+async def publish_results_bulk(bot: Bot, games: list, league: str,
+                                session: aiohttp.ClientSession):
+    """
+    Espera a que TODOS los juegos de la liga del día estén finales
+    y publica todos los resultados en UN SOLO mensaje con imagen del primer juego.
+    """
+    global _bulk_state
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    state = _bulk_state.setdefault(league, {"sent": False, "date": ""})
+    if state["date"] != today_str:
+        state["sent"]  = False
+        state["date"]  = today_str
+
+    if state["sent"]:
+        return
+
+    final_games = [g for g in games if df.is_game_final(g)]
+    non_final   = [g for g in games if not df.is_game_final(g)
+                   and not df.is_game_postponed(g)]
+
+    if non_final:
+        logger.info(f"[{league.upper()}] Esperando {len(non_final)} juego(s) para publicar resultados")
+        return
+    if not final_games:
+        return
+
+    state["sent"] = True
+
+    # Texto con todos los resultados
+    lines = ["📢 | <b>FINAL DEL JUEGO</b>", ""]
+    for game in final_games:
+        away = df.get_team_info(game, "away")
+        home = df.get_team_info(game, "home")
+        ad   = away["name"]
+        hd   = home["name"]
+        lines.append(f"↪️ {ad} {away['score']}-{home['score']} {hd}")
+
+    lines += ["", VIDEOS_LINE, "", SUBSCRIBE_LINE]
+
+    # Imagen basada en el primer juego
+    game_data   = await _build_game_data(final_games[0], session)
+    image_bytes = await ig.generate_final_result_image(game_data, league)
+
+    await _send_photo(bot, _channel_for(league), image_bytes, "\n".join(lines))
+    logger.info(f"[{league.upper()}] Resultados bulk: {len(final_games)} juego(s)")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -490,36 +405,32 @@ async def run_scheduler(bot: Bot):
                     _sent_lineups.clear()
                     logger.info(f"✅ Publicación diaria: {today_str}")
 
-                # ── 2. MLB: esperar a todos los finales, luego bulk ───
+                # ── 2. MLB: bulk cuando todos terminen + lineups en postseason ─
                 mlb_games = await df.get_mlb_games(session, today_str)
-                await publish_mlb_results_bulk(bot, mlb_games, session)
-                # Alineaciones MLB solo en postseason
+                await publish_results_bulk(bot, mlb_games, "mlb", session)
                 for game in mlb_games:
                     if df.is_postseason(game):
                         await publish_lineup(bot, game, "mlb", session)
                 await asyncio.sleep(5)
 
-                # ── 3. LVBP: resultado + alineación por juego ────────
+                # ── 3. LVBP: bulk + lineups ───────────────────────────
                 lvbp_games = await df.get_lvbp_games(session, today_str)
+                await publish_results_bulk(bot, lvbp_games, "lvbp", session)
                 for game in lvbp_games:
-                    if df.is_game_final(game):
-                        await publish_single_result(bot, game, "lvbp", session)
                     await publish_lineup(bot, game, "lvbp", session)
                 await asyncio.sleep(5)
 
-                # ── 4. Serie del Caribe ───────────────────────────────
+                # ── 4. Serie del Caribe: bulk + lineups ───────────────
                 caribe_games = await df.get_caribe_games(session, today_str)
+                await publish_results_bulk(bot, caribe_games, "caribe", session)
                 for game in caribe_games:
-                    if df.is_game_final(game):
-                        await publish_single_result(bot, game, "caribe", session)
                     await publish_lineup(bot, game, "caribe", session)
                 await asyncio.sleep(5)
 
-                # ── 5. WBC ────────────────────────────────────────────
+                # ── 5. WBC: bulk + lineups ────────────────────────────
                 wbc_games = await df.get_wbc_games_auto(session, today_str)
+                await publish_results_bulk(bot, wbc_games, "wbc", session)
                 for game in wbc_games:
-                    if df.is_game_final(game):
-                        await publish_single_result(bot, game, "wbc", session)
                     await publish_lineup(bot, game, "wbc", session)
 
         except Exception as e:
@@ -665,7 +576,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 Fecha: {date.today()}\n"
         f"📊 Resultados enviados: {len(_sent_results)}\n"
         f"📋 Alineaciones enviadas: {len(_sent_lineups)}\n"
-        f"⚾ MLB bulk enviado hoy: {'Sí' if _mlb_results_sent_today else 'No'}\n"
+        f"⚾ Ligas con bulk enviado: {[k for k,v in _bulk_state.items() if v.get('sent')]}\n"
         f"🔄 WBC: detección automática\n"
         f"📡 Canal principal: {CHANNEL_ID or 'no configurado'}"
     )
