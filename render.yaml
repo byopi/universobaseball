@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: baseball-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: CHANNEL_MLB
+        sync: false
+      - key: CHANNEL_LVBP
+        sync: false
+      - key: CHANNEL_CARIBE
+        sync: false
+      - key: CHANNEL_WBC
+        sync: false
+      - key: PORT
+        value: "8080"
