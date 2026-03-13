@@ -133,6 +133,11 @@ def is_game_preview(game: dict) -> bool:
     return game.get("status", {}).get("abstractGameState") == "Preview"
 
 
+
+def is_game_postponed(game: dict) -> bool:
+    detail = game.get("status", {}).get("detailedState", "")
+    return "Postponed" in detail or "Suspended" in detail
+
 def is_postseason(game: dict) -> bool:
     return game.get("gameType", "") in ("D", "L", "W", "F")
 

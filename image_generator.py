@@ -121,13 +121,12 @@ async def _get_flag(country_code: str, size: tuple = (80, 53)) -> Image.Image | 
     return await _download_image(url, size)
 
 
-async def _apply_watermark(img: Image.Image, opacity: int = 55,
-                           max_width_ratio: float = 0.28) -> Image.Image:
+async def _apply_watermark(img: Image.Image, opacity: int = 45,
+                           max_width_ratio: float = 0.18) -> Image.Image:
     """
-    Descarga y aplica el logo Universo Baseball como watermark
-    en la esquina inferior derecha de la imagen.
-    opacity: 0-255 (55 = semitransparente, sutil)
-    max_width_ratio: fracción del ancho de la imagen
+    Watermark centrado y pequeño — igual que livescoreuf.
+    opacity: 45/255 = muy sutil
+    max_width_ratio: 18% del ancho
     """
     wm = await _download_image(WATERMARK_URL)
     if wm is None:
@@ -148,10 +147,9 @@ async def _apply_watermark(img: Image.Image, opacity: int = 55,
     a = a.point(lambda x: int(x * opacity / 255))
     wm.putalpha(a)
 
-    # Posición: esquina inferior derecha con margen
-    margin = 14
-    x = W - new_w - margin
-    y = H - new_h - margin
+    # Posición: centrado horizontalmente, centrado verticalmente
+    x = (W - new_w) // 2
+    y = (H - new_h) // 2
 
     # Pegar sobre imagen base
     img_rgba = img.convert("RGBA")
