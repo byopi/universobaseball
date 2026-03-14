@@ -333,17 +333,21 @@ async def publish_lineup(bot: Bot, game: dict, league: str,
     lineups     = df.get_lineup_from_game(game)
     away_lineup = lineups.get("away", [])
     home_lineup = lineups.get("home", [])
-    if not away_lineup and not home_lineup:
+    # Si falta alguno de los dos, intentar obtenerlos del boxscore
+    if not away_lineup or not home_lineup:
         box          = await df.get_game_boxscore(session, game_pk)
         away_batters = box.get("teams",{}).get("away",{}).get("batters", [])
         home_batters = box.get("teams",{}).get("home",{}).get("batters", [])
         away_players = box.get("teams",{}).get("away",{}).get("players", {})
         home_players = box.get("teams",{}).get("home",{}).get("players", {})
-        away_lineup  = [away_players.get(f"ID{p}",{}).get("person",{})
-                        for p in away_batters[:9] if f"ID{p}" in away_players]
-        home_lineup  = [home_players.get(f"ID{p}",{}).get("person",{})
-                        for p in home_batters[:9] if f"ID{p}" in home_players]
-    if not away_lineup and not home_lineup:
+        if not away_lineup:
+            away_lineup = [away_players.get(f"ID{p}",{}).get("person",{})
+                           for p in away_batters[:9] if f"ID{p}" in away_players]
+        if not home_lineup:
+            home_lineup = [home_players.get(f"ID{p}",{}).get("person",{})
+                           for p in home_batters[:9] if f"ID{p}" in home_players]
+    # Solo publicar si AMBOS equipos tienen alineación
+    if not away_lineup or not home_lineup:
         return
     _sent_lineups.add(key)
     away_country = _country_from_team(away["name"])
@@ -700,27 +704,28 @@ async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]:
             games = await fetcher(session, today_str)
             for g in games:
-                state = g.get("status", {}).get("abstractGameState", "")
-                if state in ("Live", "Preview"):
-                    away  = df.get_team_info(g, "away")
-                    home  = df.get_team_info(g, "home")
-                    label = f"{away['abbreviation'] or away['name']} vs {home['abbreviation'] or home['name']}"
-                    if state == "Live":
-                        label = "🔴 " + label
-                    else:
-                        label = "⏳ " + label
-                    candidates.append((g.get("gamePk"), label, league))
+                if df.is_game_final(g):
+                    continue
+                away  = df.get_team_info(g, "away")
+                home  = df.get_team_info(g, "home")
+                label = f"{away['abbreviation'] or away['name']} vs {home['abbreviation'] or home['name']}"
+                label = ("🔴 " if df.is_game_live(g) else "⏳ ") + label
+                candidates.append((g.get("gamePk"), label, league))
 
         wbc = await df.get_wbc_games_auto(session, today_str)
         for g in wbc:
+            # Incluir cualquier juego que no haya terminado (Live, Preview, Scheduled, etc.)
+            if df.is_game_final(g):
+                continue
+            away  = df.get_team_info(g, "away")
+            home  = df.get_team_info(g, "home")
+            label = f"{away['name']} vs {home['name']}"
             state = g.get("status", {}).get("abstractGameState", "")
-            if state in ("Live", "Preview"):
-                away  = df.get_team_info(g, "away")
-                home  = df.get_team_info(g, "home")
-                label = f"{away['name']} vs {home['name']}"
-                if state == "Live":
-                    label = "🔴 " + label
-                candidates.append((g.get("gamePk"), label, "wbc"))
+            if df.is_game_live(g):
+                label = "🔴 " + label
+            else:
+                label = "⏳ " + label
+            candidates.append((g.get("gamePk"), label, "wbc"))
 
     if not candidates:
         await update.message.reply_text("No hay juegos en curso o próximos ahora mismo.")
