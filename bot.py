@@ -738,6 +738,10 @@ async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"[LIVESCORE] Error fetching WBC: {e}", exc_info=True)
 
+    # Priorizar WBC al inicio de la lista para que no queden cortados
+    wbc_candidates   = [(pk, lbl, lg) for pk, lbl, lg in candidates if lg == "wbc"]
+    other_candidates = [(pk, lbl, lg) for pk, lbl, lg in candidates if lg != "wbc"]
+    candidates = wbc_candidates + other_candidates
     logger.info(f"[LIVESCORE] Candidatos encontrados: {candidates}")
 
     if not candidates:
@@ -751,7 +755,7 @@ async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Construir teclado inline — filtrar gamePk nulos
     keyboard = []
-    for game_pk, label, league in candidates[:10]:
+    for game_pk, label, league in candidates[:20]:
         if not game_pk:
             continue
         # Asegurarse que el label no esté vacío
