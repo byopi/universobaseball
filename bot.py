@@ -8,10 +8,6 @@ import asyncio
 import logging
 import aiohttp
 from datetime import datetime, date, timedelta
-
-def _today_vz() -> str:
-    """Fecha actual en Venezuela (UTC-4) — referencia para todos los juegos."""
-    return datetime.now(VZ_TZ).strftime("%Y-%m-%d")
 from zoneinfo import ZoneInfo
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -50,15 +46,15 @@ MLB_RESULTS_PHOTO = (
 )
 
 # ─── Estado en memoria ────────────────────────────────────────
-_sent_results:     set  = set()
-_sent_lineups:     set  = set()
-_bulk_state:       dict = {}       # {league: {"sent": bool, "date": str}}
-_games_today_sent: str  = ""
-_mlb_bulk_sent:    str  = ""       # fecha en que se envió el bulk de MLB
+_sent_results:  set  = set()
+_sent_lineups:  set  = set()
+_games_today_sent: str = ""
+_mlb_bulk_sent:    str = ""
+_livescore_tasks: dict = {}   # {game_pk: {"league": str, "task": asyncio.Task}}
 
-# livescore activo: {game_pk: {"league": str, "last_inning": int,
-#                               "chat_id": str, "task": asyncio.Task}}
-_livescore_tasks: dict = {}
+
+def _today_vz() -> str:
+    return datetime.now(VZ_TZ).strftime("%Y-%m-%d")
 
 
 def _channel_for(league: str) -> str:
@@ -83,30 +79,25 @@ def _tz_for(league: str):
 #  BANDERAS Y PAÍSES
 # ─────────────────────────────────────────────────────────────
 _COUNTRY_MAP = {
-    "toronto":          "CAN",
-    "montreal":         "CAN",
-    "dominican":        "DOM", "república dominicana": "DOM", "d.r.": "DOM",
-    "venezuela":        "VEN", "venezuelan": "VEN",
-    "puerto rico":      "PUR", "puerto rican": "PUR",
-    "cuba":             "CUB",
-    "mexico":           "MEX", "méxico": "MEX",
-    "panama":           "PAN", "panamá": "PAN",
-    "united states":    "USA", "team usa": "USA",
-    "japan":            "JPN", "japón": "JPN",
-    "korea":            "KOR", "south korea": "KOR",
-    "australia":        "AUS",
-    "italy":            "ITA", "italia": "ITA",
-    "netherlands":      "NED", "países bajos": "NED",
-    "nicaragua":        "NIC",
-    "colombia":         "COL",
-    "brazil":           "BRA", "brasil": "BRA",
-    "chinese taipei":   "TPE",
-    "china":            "CHN",
-    "great britain":    "GBR",
-    "israel":           "ISR",
-    "new zealand":      "NZL",
-    "south africa":     "ZAF",
-    "czech republic":   "CZE",
+    "toronto": "CAN", "montreal": "CAN",
+    "dominican": "DOM", "república dominicana": "DOM", "d.r.": "DOM",
+    "venezuela": "VEN", "venezuelan": "VEN",
+    "puerto rico": "PUR", "puerto rican": "PUR",
+    "cuba": "CUB",
+    "mexico": "MEX", "méxico": "MEX",
+    "panama": "PAN", "panamá": "PAN",
+    "united states": "USA", "team usa": "USA",
+    "japan": "JPN", "japón": "JPN",
+    "korea": "KOR", "south korea": "KOR",
+    "australia": "AUS",
+    "italy": "ITA", "italia": "ITA",
+    "netherlands": "NED", "países bajos": "NED",
+    "nicaragua": "NIC", "colombia": "COL",
+    "brazil": "BRA", "brasil": "BRA",
+    "chinese taipei": "TPE", "china": "CHN",
+    "great britain": "GBR", "israel": "ISR",
+    "new zealand": "NZL", "south africa": "ZAF",
+    "czech republic": "CZE",
 }
 
 _FLAG_EMOJI = {
@@ -152,7 +143,11 @@ async def _send_photo(bot: Bot, chat_id: str, image_bytes: bytes, caption: str =
 
 async def _send_message(bot: Bot, chat_id: str, text: str):
     try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        await bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except TelegramError as e:
         logger.error(f"Error enviando mensaje a {chat_id}: {e}")
 
@@ -219,7 +214,7 @@ async def publish_all_games_today(bot: Bot, date_str: str,
 
 
 # ─────────────────────────────────────────────────────────────
-#  FORMATO 2: RESULTADOS BULK
+#  FORMATO 2A: MLB — bulk cuando todos terminen, foto sin editar
 # ─────────────────────────────────────────────────────────────
 async def _build_game_data(game: dict, session: aiohttp.ClientSession) -> dict:
     game_pk = game.get("gamePk")
@@ -236,7 +231,7 @@ async def _build_game_data(game: dict, session: aiohttp.ClientSession) -> dict:
         "home_id":   home["id"] if not home_country else None,
         "away_country": away_country, "home_country": home_country,
         "away_score": away["score"], "home_score": home["score"],
-        "innings": linescore.get("currentInning", 9),
+        "innings": (linescore or {}).get("currentInning", 9),
         "away_hits":   box.get("teams",{}).get("away",{}).get("teamStats",{}).get("batting", {}).get("hits",   "-"),
         "home_hits":   box.get("teams",{}).get("home",{}).get("teamStats",{}).get("batting", {}).get("hits",   "-"),
         "away_errors": box.get("teams",{}).get("away",{}).get("teamStats",{}).get("fielding",{}).get("errors", "-"),
@@ -249,15 +244,10 @@ async def _build_game_data(game: dict, session: aiohttp.ClientSession) -> dict:
 
 async def publish_mlb_results_bulk(bot: Bot, games: list,
                                     session: aiohttp.ClientSession):
-    """
-    MLB: espera que TODOS los juegos terminen y manda un único mensaje
-    con la foto original (sin editar) + todos los resultados.
-    """
     global _mlb_bulk_sent
-    today_str   = _today_vz()
+    today_str = _today_vz()
     if _mlb_bulk_sent == today_str:
         return
-
     final_games = [g for g in games if df.is_game_final(g)]
     non_final   = [g for g in games if not df.is_game_final(g)
                    and not df.is_game_postponed(g)]
@@ -266,61 +256,50 @@ async def publish_mlb_results_bulk(bot: Bot, games: list,
         return
     if not final_games:
         return
-
     _mlb_bulk_sent = today_str
-
     lines = ["📢 | <b>FINAL DEL JUEGO</b>", ""]
     for game in final_games:
         away = df.get_team_info(game, "away")
         home = df.get_team_info(game, "home")
-        lines.append(
-            f"↪️ {away['full_name']} {away['score']}-{home['score']} {home['full_name']}"
-        )
+        lines.append(f"↪️ {away['full_name']} {away['score']}-{home['score']} {home['full_name']}")
     lines += ["", VIDEOS_LINE, "", SUBSCRIBE_LINE]
-    caption = "\n".join(lines)
-
     channel = _channel_for("mlb")
     try:
         await bot.send_photo(
             chat_id=channel,
-            photo=MLB_RESULTS_PHOTO,   # URL directa, sin descargar ni editar
-            caption=caption[:1024],
+            photo=MLB_RESULTS_PHOTO,
+            caption="\n".join(lines)[:1024],
             parse_mode=ParseMode.HTML,
         )
         logger.info(f"[MLB] Bulk resultados: {len(final_games)} juego(s)")
     except TelegramError as e:
-        logger.error(f"[MLB] Error enviando bulk: {e}")
+        logger.error(f"[MLB] Error bulk: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+#  FORMATO 2B: LVBP / Caribe / WBC — resultado individual con imagen
+# ─────────────────────────────────────────────────────────────
 async def publish_result_individual(bot: Bot, game: dict, league: str,
                                      session: aiohttp.ClientSession):
-    """LVBP / Caribe / WBC: publica cada juego con imagen generada apenas termina."""
     key = _game_key(game, f"result_{league}")
     if key in _sent_results:
         return
     _sent_results.add(key)
-
     away = df.get_team_info(game, "away")
     home = df.get_team_info(game, "home")
-
     game_data   = await _build_game_data(game, session)
     image_bytes = await ig.generate_final_result_image(game_data, league)
-
     lines = [
-        "📢 | <b>FINAL DEL JUEGO</b>",
-        "",
+        "📢 | <b>FINAL DEL JUEGO</b>", "",
         f"↪️ {away['full_name']} {away['score']}-{home['score']} {home['full_name']}",
-        "",
-        VIDEOS_LINE,
-        "",
-        SUBSCRIBE_LINE,
+        "", VIDEOS_LINE, "", SUBSCRIBE_LINE,
     ]
     await _send_photo(bot, _channel_for(league), image_bytes, "\n".join(lines))
     logger.info(f"[{league.upper()}] Resultado: {away['full_name']} {away['score']}-{home['score']} {home['full_name']}")
 
 
 # ─────────────────────────────────────────────────────────────
-#  FORMATO 3: ALINEACIONES
+#  FORMATO 3: ALINEACIONES — solo cuando AMBOS equipos tienen lineup
 # ─────────────────────────────────────────────────────────────
 async def publish_lineup(bot: Bot, game: dict, league: str,
                           session: aiohttp.ClientSession):
@@ -333,7 +312,7 @@ async def publish_lineup(bot: Bot, game: dict, league: str,
     lineups     = df.get_lineup_from_game(game)
     away_lineup = lineups.get("away", [])
     home_lineup = lineups.get("home", [])
-    # Si falta alguno de los dos, intentar obtenerlos del boxscore
+    # Si falta alguno intentar obtener del boxscore
     if not away_lineup or not home_lineup:
         box          = await df.get_game_boxscore(session, game_pk)
         away_batters = box.get("teams",{}).get("away",{}).get("batters", [])
@@ -362,12 +341,9 @@ async def publish_lineup(bot: Bot, game: dict, league: str,
     def _names(lu):
         return ", ".join(p.get("fullName", "") for p in lu if p.get("fullName"))
     lines = [
-        f"👥 <b>ALINEACIONES #{league.upper()} | {away['name']} vs. {home['name']}</b>",
-        "",
-        f"{_flag_emoji(away_country)} <b>{away['name']}</b>: {_names(away_lineup)}",
-        "",
-        f"{_flag_emoji(home_country)} <b>{home['name']}</b>: {_names(home_lineup)}",
-        "",
+        f"👥 <b>ALINEACIONES #{league.upper()} | {away['name']} vs. {home['name']}</b>", "",
+        f"{_flag_emoji(away_country)} <b>{away['name']}</b>: {_names(away_lineup)}", "",
+        f"{_flag_emoji(home_country)} <b>{home['name']}</b>: {_names(home_lineup)}", "",
         SUBSCRIBE_LINE,
     ]
     await _send_photo(bot, _channel_for(league), image_bytes, "\n".join(lines))
@@ -375,31 +351,19 @@ async def publish_lineup(bot: Bot, game: dict, league: str,
 
 
 # ─────────────────────────────────────────────────────────────
-#  LIVESCORE — actualiza por inning, publica al canal
+#  LIVESCORE — actualiza por cambio de SCORE (carreras anotadas)
 # ─────────────────────────────────────────────────────────────
 async def _fetch_game_obj(session: aiohttp.ClientSession,
                           game_pk: int, league: str) -> dict | None:
-    """
-    Obtiene el objeto juego actualizado según la liga.
-    Para WBC usa get_wbc_games_auto; para el resto usa MLB Stats API directamente.
-    """
     if league == "wbc":
-        # WBC: buscar en la lista de juegos del día y filtrar por gamePk
-        today  = _today_vz()
-        games  = await df.get_wbc_games_auto(session, today)
-        for g in games:
-            if g.get("gamePk") == game_pk:
-                return g
-        # También intentar ayer por desfase horario
-        from datetime import timedelta
-        yesterday = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-        games = await df.get_wbc_games_auto(session, yesterday)
-        for g in games:
-            if g.get("gamePk") == game_pk:
-                return g
+        today = _today_vz()
+        for try_date in [today, (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")]:
+            games = await df.get_wbc_games_auto(session, try_date)
+            for g in games:
+                if g.get("gamePk") == game_pk:
+                    return g
         return None
     else:
-        # MLB/LVBP/Caribe: usar endpoint directo por gamePk
         data = await df.fetch_json(
             session,
             "https://statsapi.mlb.com/api/v1/schedule",
@@ -415,12 +379,14 @@ async def _fetch_game_obj(session: aiohttp.ClientSession,
 
 async def _livescore_loop(bot: Bot, game_pk: int, league: str, chat_id: str):
     """
-    Monitorea un juego y publica al canal cada vez que cambia el inning.
-    Soporta MLB, LVBP, Caribe y WBC usando la fuente correcta para cada liga.
+    Publica al canal cada vez que cambia el SCORE (carreras anotadas).
+    Si se anotan 2+ carreras en un mismo turno, publica el total de una vez.
+    También actualiza por inning cuando no hay cambio de score.
     """
     logger.info(f"[LIVESCORE] Iniciando gamePk={game_pk} liga={league}")
-    last_inning        = -1
     consecutive_errors = 0
+    last_score         = (-1, -1)   # (away_score, home_score)
+    last_inning_state  = (-1, "")   # (inning, half) — backup si no hay cambio de score
 
     while True:
         try:
@@ -431,20 +397,19 @@ async def _livescore_loop(bot: Bot, game_pk: int, league: str, chat_id: str):
             if not game_obj:
                 consecutive_errors += 1
                 if consecutive_errors > 8:
-                    logger.warning(f"[LIVESCORE] gamePk={game_pk} no encontrado tras 8 intentos, cancelando")
+                    logger.warning(f"[LIVESCORE] {game_pk} no encontrado, cancelando")
                     break
-                logger.debug(f"[LIVESCORE] gamePk={game_pk} no encontrado (intento {consecutive_errors})")
                 await asyncio.sleep(60)
                 continue
 
             consecutive_errors = 0
-            away   = df.get_team_info(game_obj, "away")
-            home   = df.get_team_info(game_obj, "home")
-            status = game_obj.get("status", {}).get("abstractGameState", "")
+            away = df.get_team_info(game_obj, "away")
+            home = df.get_team_info(game_obj, "home")
 
             # ── Juego terminado ──
             if df.is_game_final(game_obj):
-                innings = linescore.get("currentInning", 9) if linescore else 9
+                ls       = game_obj.get("linescore") or linescore or {}
+                innings  = ls.get("currentInning", 9)
                 text = (
                     "❗️ | <b>LIVESCORE</b>\n\n"
                     f"<b>{away['full_name']} {away['score']}-{home['score']} {home['full_name']}</b>\n\n"
@@ -452,67 +417,74 @@ async def _livescore_loop(bot: Bot, game_pk: int, league: str, chat_id: str):
                     f"{SUBSCRIBE_LINE_BOLD}"
                 )
                 await _send_message(bot, chat_id, text)
-                logger.info(f"[LIVESCORE] gamePk={game_pk} finalizado")
+                logger.info(f"[LIVESCORE] {game_pk} FINAL {away['score']}-{home['score']}")
                 break
 
-            # ── Juego en vivo: publicar si cambió el inning ──
+            # ── Juego en vivo ──
             if df.is_game_live(game_obj):
-                # Linescore del game_obj embebido (más fiable para WBC)
-                ls_embedded = game_obj.get("linescore", {})
-                ls_data     = ls_embedded if ls_embedded else linescore or {}
+                ls             = game_obj.get("linescore") or linescore or {}
+                current_inning = ls.get("currentInning", 0)
+                inning_half    = (ls.get("inningHalf") or "").lower()
+                inning_ordinal = ls.get("currentInningOrdinal") or f"#{current_inning}"
+                half_str       = "▲" if "top" in inning_half else "▼"
 
-                current_inning = ls_data.get("currentInning", 0)
-                inning_half    = ls_data.get("inningHalf", "")
-                inning_ordinal = ls_data.get("currentInningOrdinal", f"#{current_inning}")
+                away_score = away["score"]
+                home_score = home["score"]
+                current_score = (away_score, home_score)
+                current_inning_state = (current_inning, inning_half)
 
-                if current_inning != last_inning and current_inning > 0:
-                    last_inning = current_inning
-                    half_str = "▲" if inning_half in ("Top", "top") else "▼"
+                # Disparar si el SCORE cambió (carreras anotadas — puede ser 1 o más de golpe)
+                score_changed  = current_score != last_score and last_score != (-1, -1)
+                # También disparar si cambió el inning (turno nuevo) aunque no haya score
+                inning_changed = current_inning_state != last_inning_state and current_inning > 0
+
+                if score_changed or (inning_changed and last_inning_state != (-1, "")):
+                    last_score        = current_score
+                    last_inning_state = current_inning_state
                     text = (
                         "❗️ | <b>LIVESCORE</b>\n\n"
-                        f"<b>{away['full_name']} {away['score']}-{home['score']} {home['full_name']}</b>\n\n"
+                        f"<b>{away['full_name']} {away_score}-{home_score} {home['full_name']}</b>\n\n"
                         f"➡️ {half_str} {inning_ordinal}\n\n"
                         f"{SUBSCRIBE_LINE_BOLD}"
                     )
                     await _send_message(bot, chat_id, text)
-                    logger.info(f"[LIVESCORE] {game_pk} inning {half_str}{inning_ordinal} | {away['score']}-{home['score']}")
+                    reason = "score" if score_changed else "inning"
+                    logger.info(f"[LIVESCORE] {game_pk} {half_str}{inning_ordinal} {away_score}-{home_score} ({reason})")
+                else:
+                    # Primer ciclo — inicializar sin publicar
+                    if last_score == (-1, -1):
+                        last_score        = current_score
+                        last_inning_state = current_inning_state
+                        logger.info(f"[LIVESCORE] {game_pk} iniciado en {half_str}{inning_ordinal} {away_score}-{home_score}")
 
         except asyncio.CancelledError:
-            logger.info(f"[LIVESCORE] gamePk={game_pk} cancelado")
+            logger.info(f"[LIVESCORE] {game_pk} cancelado")
             break
         except Exception as e:
-            logger.error(f"[LIVESCORE] Error gamePk={game_pk}: {e}", exc_info=True)
+            logger.error(f"[LIVESCORE] Error {game_pk}: {e}", exc_info=True)
 
-        await asyncio.sleep(90)
+        await asyncio.sleep(45)   # revisar cada 45 segundos
 
     _livescore_tasks.pop(game_pk, None)
 
 
 # ─────────────────────────────────────────────────────────────
 #  SCHEDULER
-#  - Juegos del día: se publica exactamente a las 00:00 UTC-4
-#  - Resultados / lineups: se revisan cada 5 minutos
 # ─────────────────────────────────────────────────────────────
 def _seconds_until_midnight_vz() -> float:
-    """Segundos que faltan para las 00:00 en UTC-4 (Venezuela/Caracas)."""
-    now_vz    = datetime.now(VZ_TZ)
-    tomorrow  = (now_vz + timedelta(days=1)).replace(
-                    hour=0, minute=0, second=0, microsecond=0)
+    now_vz   = datetime.now(VZ_TZ)
+    tomorrow = (now_vz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return (tomorrow - now_vz).total_seconds()
 
 
 async def run_scheduler(bot: Bot):
     logger.info("Scheduler iniciado ✅")
 
-    # ── Tarea de juegos del día: publica exactamente a las 00:00 VZ ──
-    # NO publica al arrancar — solo en medianoche.
     async def _games_today_loop():
         while True:
-            # Dormir hasta la próxima medianoche VZ
             secs = _seconds_until_midnight_vz()
-            logger.info(f"[games_today] Próxima publicación en {secs/3600:.1f}h (00:00 VZ)")
-            await asyncio.sleep(secs + 5)   # +5s de margen para asegurarse
-
+            logger.info(f"[games_today] Próxima publicación en {secs/3600:.1f}h")
+            await asyncio.sleep(secs + 5)
             try:
                 now_vz       = datetime.now(VZ_TZ)
                 date_display = now_vz.strftime("%d de %B de %Y")
@@ -521,23 +493,19 @@ async def run_scheduler(bot: Bot):
             except Exception as e:
                 logger.error(f"[games_today] Error: {e}", exc_info=True)
 
-    # Lanzar la tarea de medianoche en paralelo
     asyncio.create_task(_games_today_loop())
 
-    # ── Loop principal: resultados + lineups cada 5 minutos ──
     while True:
         try:
             today_str = _today_vz()
-
             async with aiohttp.ClientSession() as session:
-                # MLB — bulk cuando todos terminen
+                # MLB bulk
                 mlb_games = await df.get_mlb_games(session, today_str)
                 await publish_mlb_results_bulk(bot, mlb_games, session)
                 for game in mlb_games:
                     if df.is_postseason(game):
                         await publish_lineup(bot, game, "mlb", session)
                 await asyncio.sleep(5)
-
                 # LVBP
                 lvbp_games = await df.get_lvbp_games(session, today_str)
                 for game in lvbp_games:
@@ -545,7 +513,6 @@ async def run_scheduler(bot: Bot):
                         await publish_result_individual(bot, game, "lvbp", session)
                     await publish_lineup(bot, game, "lvbp", session)
                 await asyncio.sleep(5)
-
                 # Caribe
                 caribe_games = await df.get_caribe_games(session, today_str)
                 for game in caribe_games:
@@ -553,17 +520,14 @@ async def run_scheduler(bot: Bot):
                         await publish_result_individual(bot, game, "caribe", session)
                     await publish_lineup(bot, game, "caribe", session)
                 await asyncio.sleep(5)
-
                 # WBC
                 wbc_games = await df.get_wbc_games_auto(session, today_str)
                 for game in wbc_games:
                     if df.is_game_final(game):
                         await publish_result_individual(bot, game, "wbc", session)
                     await publish_lineup(bot, game, "wbc", session)
-
         except Exception as e:
             logger.error(f"Error en scheduler: {e}", exc_info=True)
-
         await asyncio.sleep(300)
 
 
@@ -576,12 +540,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Comandos:</b>\n"
         "/juegos — Juegos de hoy de todas las ligas\n"
         "/resultados — Resultados del día\n"
-        "/livescore — Iniciar livescore de un partido\n"
-        "/lineup — Forzar envío de alineaciones al canal\n"
-        "/test — Preview de imagen de resultado\n"
+        "/livescore — Livescore por carreras anotadas\n"
+        "/lineup — Forzar envío de alineaciones\n"
+        "/test — Preview imagen de resultado\n"
         "/status — Estado del bot\n"
-        "/hoy — Seguimiento en vivo (solo en privado)\n"
-        "/debug — Diagnóstico de API (qué juegos se detectan)",
+        "/hoy — En vivo (solo privado)\n"
+        "/debug — Diagnóstico de API",
         parse_mode=ParseMode.HTML,
     )
 
@@ -590,7 +554,6 @@ async def cmd_juegos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_str = _today_vz()
     lines     = ["🍿 ¡JUEGOS DE HOY! ⚾️", ""]
     found_any = False
-
     async with aiohttp.ClientSession() as session:
         for league, fetcher, header in [
             ("mlb",    df.get_mlb_games,    "🇺🇸 | <b>MLB</b>"),
@@ -609,7 +572,6 @@ async def cmd_juegos(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 t    = df.get_game_time_str(g, _tz_for(league))
                 lines.append(f"{away['full_name']} - {home['full_name']}  {t}")
             lines.append("")
-
         wbc = await df.get_wbc_games_auto(session, today_str)
         if wbc:
             found_any = True
@@ -621,7 +583,6 @@ async def cmd_juegos(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 t    = df.get_game_time_str(g, ET_TZ)
                 lines.append(f"{away['full_name']} - {home['full_name']}  {t}")
             lines.append("")
-
     if not found_any:
         await update.message.reply_text("No hay juegos programados para hoy.")
         return
@@ -634,14 +595,11 @@ async def cmd_juegos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Seguimiento en vivo — solo privado."""
     if update.effective_chat.type != "private":
-        await update.message.reply_text(
-            "Este comando solo funciona en privado para no spamear el canal."
-        )
+        await update.message.reply_text("Este comando solo funciona en privado.")
         return
     today_str = _today_vz()
-    lines     = [f"🔴 <b>EN VIVO — {date.today().strftime('%d/%m/%Y')}</b>\n"]
+    lines     = [f"🔴 <b>EN VIVO — {datetime.now(VZ_TZ).strftime('%d/%m/%Y')}</b>\n"]
     async with aiohttp.ClientSession() as session:
         for label, fetcher, emoji, tz in [
             ("MLB",          df.get_mlb_games,    "🇺🇸", ET_TZ),
@@ -657,11 +615,11 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 away  = df.get_team_info(g, "away")
                 home  = df.get_team_info(g, "home")
                 t     = df.get_game_time_str(g, tz)
-                state = g.get("status", {}).get("abstractGameState", "")
-                if state == "Final":
+                if df.is_game_final(g):
                     lines.append(f"✅ {away['full_name']} <b>{away['score']}</b>-<b>{home['score']}</b> {home['full_name']}")
-                elif state == "Live":
-                    inn = g.get("linescore", {}).get("currentInningOrdinal", "")
+                elif df.is_game_live(g):
+                    ls  = g.get("linescore", {})
+                    inn = ls.get("currentInningOrdinal", "")
                     lines.append(f"🔴 {away['full_name']} {away['score']}-{home['score']} {home['full_name']} ({inn})")
                 else:
                     lines.append(f"⏳ {away['full_name']} - {home['full_name']}  {t}")
@@ -673,11 +631,10 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for g in wbc:
                 away  = df.get_team_info(g, "away")
                 home  = df.get_team_info(g, "home")
-                state = g.get("status", {}).get("abstractGameState", "")
                 t     = df.get_game_time_str(g, ET_TZ)
-                if state == "Final":
+                if df.is_game_final(g):
                     lines.append(f"✅ {away['full_name']} <b>{away['score']}</b>-<b>{home['score']}</b> {home['full_name']}")
-                elif state == "Live":
+                elif df.is_game_live(g):
                     lines.append(f"🔴 {away['full_name']} {away['score']}-{home['score']} {home['full_name']}")
                 else:
                     lines.append(f"⏳ {away['full_name']} - {home['full_name']}  {t}")
@@ -685,19 +642,15 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(lines) == 1:
         lines.append("No hay juegos hoy.")
     lines.append(SUBSCRIBE_LINE)
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
 
 
 async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Muestra los juegos en curso/próximos con botones.
-    El usuario selecciona uno y el bot inicia el livescore al canal.
-    """
-    today_str = _today_vz()
-    candidates = []   # (game_pk, label, league)
+    today_str  = _today_vz()
+    candidates = []
 
     async with aiohttp.ClientSession() as session:
-        # MLB / LVBP / Caribe
         for league, fetcher in [
             ("mlb",    df.get_mlb_games),
             ("lvbp",   df.get_lvbp_games),
@@ -708,115 +661,99 @@ async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for g in games:
                     if df.is_game_final(g):
                         continue
-                    away  = df.get_team_info(g, "away")
-                    home  = df.get_team_info(g, "home")
-                    lbl   = (away["abbreviation"] or away["name"]) + " vs " + (home["abbreviation"] or home["name"])
-                    lbl   = ("🔴 " if df.is_game_live(g) else "⏳ ") + lbl
-                    pk    = g.get("gamePk")
+                    away = df.get_team_info(g, "away")
+                    home = df.get_team_info(g, "home")
+                    lbl  = (away["abbreviation"] or away["name"]) + " vs " + (home["abbreviation"] or home["name"])
+                    lbl  = ("🔴 " if df.is_game_live(g) else "⏳ ") + lbl
+                    pk   = g.get("gamePk")
                     if pk:
                         candidates.append((pk, lbl, league))
             except Exception as e:
                 logger.error(f"[LIVESCORE] Error fetching {league}: {e}")
 
-        # WBC — sesión propia para aislar errores
         try:
             wbc = await df.get_wbc_games_auto(session, today_str)
             logger.info(f"[LIVESCORE] WBC juegos encontrados: {len(wbc)}")
             for g in wbc:
                 if df.is_game_final(g):
-                    logger.info(f"[LIVESCORE] WBC pk={g.get('gamePk')} saltado (final)")
                     continue
                 away     = df.get_team_info(g, "away")
                 home     = df.get_team_info(g, "home")
-                away_lbl = away["full_name"] or away["name"] or away["abbreviation"] or "Visitante"
-                home_lbl = home["full_name"] or home["name"] or home["abbreviation"] or "Local"
+                away_lbl = away["full_name"] or away["name"] or "Visitante"
+                home_lbl = home["full_name"] or home["name"] or "Local"
                 lbl      = ("🔴 " if df.is_game_live(g) else "⏳ ") + f"{away_lbl} vs {home_lbl}"
                 pk       = g.get("gamePk") or g.get("id")
-                logger.info(f"[LIVESCORE] WBC añadiendo pk={pk} label={lbl}")
                 if pk:
                     candidates.append((pk, lbl, "wbc"))
+                    logger.info(f"[LIVESCORE] WBC añadiendo pk={pk} {lbl}")
         except Exception as e:
             logger.error(f"[LIVESCORE] Error fetching WBC: {e}", exc_info=True)
 
-    # Priorizar WBC al inicio de la lista para que no queden cortados
-    wbc_candidates   = [(pk, lbl, lg) for pk, lbl, lg in candidates if lg == "wbc"]
-    other_candidates = [(pk, lbl, lg) for pk, lbl, lg in candidates if lg != "wbc"]
-    candidates = wbc_candidates + other_candidates
-    logger.info(f"[LIVESCORE] Candidatos encontrados: {candidates}")
+    # WBC al frente
+    wbc_c   = [(pk, lbl, lg) for pk, lbl, lg in candidates if lg == "wbc"]
+    other_c = [(pk, lbl, lg) for pk, lbl, lg in candidates if lg != "wbc"]
+    candidates = wbc_c + other_c
+    logger.info(f"[LIVESCORE] Candidatos: {candidates}")
 
     if not candidates:
-        today_str2 = _today_vz()
         await update.message.reply_text(
-            f"No hay juegos en curso o próximos ahora mismo.\n"
-            f"(Fecha buscada: {today_str2})\n"
-            f"Prueba /debug para ver qué encuentra la API."
+            f"No hay juegos en curso o próximos ahora mismo. (Fecha: {today_str})\n"
+            "Prueba /debug para ver qué detecta la API.",
+            disable_web_page_preview=True,
         )
         return
 
-    # Construir teclado inline — filtrar gamePk nulos
     keyboard = []
     for game_pk, label, league in candidates[:20]:
-        if not game_pk:
-            continue
-        # Asegurarse que el label no esté vacío
         if not label.strip() or label.strip() in ("🔴 ", "⏳ "):
             label = f"{'🔴' if '🔴' in label else '⏳'} Juego #{game_pk}"
-        keyboard.append([InlineKeyboardButton(
-            label[:60],  # límite seguro para Telegram
-            callback_data=f"ls_{game_pk}_{league}"
-        )])
-    if _livescore_tasks:
-        keyboard.append([InlineKeyboardButton(
-            "⛔ Detener todos los livescores", callback_data="ls_stop_all"
-        )])
+        keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"ls_{game_pk}_{league}")])
 
-    if not keyboard:
-        await update.message.reply_text("No se pudieron cargar los juegos. Intenta de nuevo.")
-        return
+    if _livescore_tasks:
+        keyboard.append([InlineKeyboardButton("⛔ Detener todos", callback_data="ls_stop_all")])
 
     await update.message.reply_text(
         "⚾ <b>Selecciona el juego para activar el livescore al canal:</b>",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
 async def cb_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback del teclado inline de /livescore."""
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data  = query.data
 
     if data == "ls_stop_all":
-        for task in _livescore_tasks.values():
-            t = task.get("task")
+        for v in _livescore_tasks.values():
+            t = v.get("task")
             if t and not t.done():
                 t.cancel()
         _livescore_tasks.clear()
-        await query.edit_message_text("⛔ Todos los livescores detenidos.")
+        await query.edit_message_text("⛔ Todos los livescores detenidos.",
+                                      disable_web_page_preview=True)
         return
 
-    # Formato: ls_{game_pk}_{league}
-    parts    = data.split("_", 2)
-    game_pk  = int(parts[1])
-    league   = parts[2]
-    chat_id  = _channel_for(league)
+    parts   = data.split("_", 2)
+    game_pk = int(parts[1])
+    league  = parts[2]
+    chat_id = _channel_for(league)
 
     if game_pk in _livescore_tasks:
-        await query.edit_message_text(f"⚠️ Ya hay un livescore activo para ese juego.")
+        await query.edit_message_text("⚠️ Ya hay un livescore activo para ese juego.",
+                                      disable_web_page_preview=True)
         return
 
-    task = asyncio.create_task(
-        _livescore_loop(context.bot, game_pk, league, chat_id)
-    )
+    task = asyncio.create_task(_livescore_loop(context.bot, game_pk, league, chat_id))
     _livescore_tasks[game_pk] = {"league": league, "task": task}
 
     await query.edit_message_text(
-        f"✅ <b>Livescore activado</b> para el juego #{game_pk}\n"
-        f"Se publicarán actualizaciones en el canal por cada inning.",
+        f"✅ <b>Livescore activado</b> — se publicará en el canal con cada carrera anotada.",
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
-    logger.info(f"[LIVESCORE] Activado para gamePk={game_pk} → canal {chat_id}")
+    logger.info(f"[LIVESCORE] Activado gamePk={game_pk} → {chat_id}")
 
 
 async def cmd_lineup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -852,85 +789,51 @@ async def cmd_lineup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Busca juegos reales finalizados hoy para hacer el preview.
-    Si no hay juegos reales usa datos de ejemplo.
-    Uso: /test  o  /test mlb|lvbp|caribe|wbc
-    """
     args   = context.args
     league = (args[0].lower() if args else "mlb")
     if league not in ("mlb", "lvbp", "caribe", "wbc"):
         await update.message.reply_text("Uso: /test mlb|lvbp|caribe|wbc")
         return
-
     today_str = _today_vz()
     game_data = None
-
     await update.message.reply_text("🔄 Buscando juego finalizado...")
-
     async with aiohttp.ClientSession() as session:
-        # Intentar encontrar un juego real finalizado hoy
         try:
-            if league == "wbc":
-                games = await df.get_wbc_games_auto(session, today_str)
-            elif league == "mlb":
-                games = await df.get_mlb_games(session, today_str)
-            elif league == "lvbp":
-                games = await df.get_lvbp_games(session, today_str)
-            else:
-                games = await df.get_caribe_games(session, today_str)
-
+            fetcher = {"mlb": df.get_mlb_games, "lvbp": df.get_lvbp_games,
+                       "caribe": df.get_caribe_games, "wbc": df.get_wbc_games_auto}[league]
+            games  = await fetcher(session, today_str)
             finals = [g for g in games if df.is_game_final(g)]
             if finals:
                 game_data = await _build_game_data(finals[0], session)
         except Exception as e:
-            logger.warning(f"[/test] Error buscando juego real: {e}")
-
-    # Fallback a datos de ejemplo si no hay juego real
+            logger.warning(f"[/test] Error: {e}")
     if not game_data:
         fallbacks = {
-            "mlb": {
-                "away_name": "New York Yankees", "home_name": "Los Angeles Dodgers",
-                "away_id": 147, "home_id": 119,
-                "away_country": None, "home_country": None,
-                "away_score": 5, "home_score": 3, "innings": 9,
-                "away_hits": 10, "home_hits": 7, "away_errors": 0, "home_errors": 1,
-                "winner_pitcher": "Gerrit Cole", "loser_pitcher": "Clayton Kershaw",
-                "save_pitcher": "Clay Holmes",
-            },
-            "lvbp": {
-                "away_name": "Leones del Caracas", "home_name": "Cardenales de Lara",
-                "away_id": None, "home_id": None,
-                "away_country": "VEN", "home_country": "VEN",
-                "away_score": 4, "home_score": 2, "innings": 9,
-                "away_hits": 8, "home_hits": 5, "away_errors": 1, "home_errors": 0,
-                "winner_pitcher": "José Rodríguez", "loser_pitcher": "Carlos Pérez",
-                "save_pitcher": "",
-            },
-            "caribe": {
-                "away_name": "Venezuela", "home_name": "Dominican Republic",
-                "away_id": None, "home_id": None,
-                "away_country": "VEN", "home_country": "DOM",
-                "away_score": 3, "home_score": 6, "innings": 9,
-                "away_hits": 6, "home_hits": 11, "away_errors": 2, "home_errors": 0,
-                "winner_pitcher": "Framber Valdez", "loser_pitcher": "Rangel Ravelo",
-                "save_pitcher": "",
-            },
-            "wbc": {
-                "away_name": "Japan", "home_name": "United States",
-                "away_id": None, "home_id": None,
-                "away_country": "JPN", "home_country": "USA",
-                "away_score": 3, "home_score": 2, "innings": 9,
-                "away_hits": 7, "home_hits": 6, "away_errors": 0, "home_errors": 1,
-                "winner_pitcher": "Shohei Ohtani", "loser_pitcher": "Adam Wainwright",
-                "save_pitcher": "Yoshinobu Yamamoto",
-            },
+            "mlb": {"away_name": "New York Yankees", "home_name": "Los Angeles Dodgers",
+                    "away_id": 147, "home_id": 119, "away_country": None, "home_country": None,
+                    "away_score": 5, "home_score": 3, "innings": 9,
+                    "away_hits": 10, "home_hits": 7, "away_errors": 0, "home_errors": 1,
+                    "winner_pitcher": "Gerrit Cole", "loser_pitcher": "Clayton Kershaw", "save_pitcher": "Clay Holmes"},
+            "lvbp": {"away_name": "Leones del Caracas", "home_name": "Cardenales de Lara",
+                     "away_id": None, "home_id": None, "away_country": "VEN", "home_country": "VEN",
+                     "away_score": 4, "home_score": 2, "innings": 9,
+                     "away_hits": 8, "home_hits": 5, "away_errors": 1, "home_errors": 0,
+                     "winner_pitcher": "José Rodríguez", "loser_pitcher": "Carlos Pérez", "save_pitcher": ""},
+            "caribe": {"away_name": "Venezuela", "home_name": "Dominican Republic",
+                       "away_id": None, "home_id": None, "away_country": "VEN", "home_country": "DOM",
+                       "away_score": 3, "home_score": 6, "innings": 9,
+                       "away_hits": 6, "home_hits": 11, "away_errors": 2, "home_errors": 0,
+                       "winner_pitcher": "Framber Valdez", "loser_pitcher": "Rangel Ravelo", "save_pitcher": ""},
+            "wbc": {"away_name": "Japan", "home_name": "United States",
+                    "away_id": None, "home_id": None, "away_country": "JPN", "home_country": "USA",
+                    "away_score": 3, "home_score": 2, "innings": 9,
+                    "away_hits": 7, "home_hits": 6, "away_errors": 0, "home_errors": 1,
+                    "winner_pitcher": "Shohei Ohtani", "loser_pitcher": "Adam Wainwright", "save_pitcher": "Yoshinobu Yamamoto"},
         }
         game_data = fallbacks[league]
-        note = " (datos de ejemplo — no hay juego finalizado hoy)"
+        note = " (datos de ejemplo)"
     else:
-        note = f" (juego real de hoy: {game_data['away_name']} vs {game_data['home_name']})"
-
+        note = f" (juego real: {game_data['away_name']} vs {game_data['home_name']})"
     image_bytes = await ig.generate_final_result_image(game_data, league)
     await update.message.reply_photo(
         photo=io.BytesIO(image_bytes),
@@ -959,9 +862,7 @@ async def cmd_resultados(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for g in finals:
                 away = df.get_team_info(g, "away")
                 home = df.get_team_info(g, "home")
-                lines.append(
-                    f"↪️ {away['full_name']} <b>{away['score']}</b>-<b>{home['score']}</b> {home['full_name']}"
-                )
+                lines.append(f"↪️ {away['full_name']} <b>{away['score']}</b>-<b>{home['score']}</b> {home['full_name']}")
             lines.append("")
         wbc   = await df.get_wbc_games_auto(session, today_str)
         finals_wbc = [g for g in wbc if df.is_game_final(g)]
@@ -972,46 +873,37 @@ async def cmd_resultados(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for g in finals_wbc:
                 away = df.get_team_info(g, "away")
                 home = df.get_team_info(g, "home")
-                lines.append(
-                    f"↪️ {away['full_name']} <b>{away['score']}</b>-<b>{home['score']}</b> {home['full_name']}"
-                )
+                lines.append(f"↪️ {away['full_name']} <b>{away['score']}</b>-<b>{home['score']}</b> {home['full_name']}")
             lines.append("")
     if not found_any:
         lines.append("Aún no hay resultados finales.")
     lines.append(SUBSCRIBE_LINE)
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_str = _today_vz()
-    results_sent = len([k for k in _sent_results if league_key in k for league_key in ["mlb","lvbp","caribe","wbc"]])
+    today_str   = _today_vz()
     ls_active   = [f"#{pk} ({v['league']})" for pk, v in _livescore_tasks.items()]
     mlb_bulk_ok = "✅" if _mlb_bulk_sent == today_str else "⏳"
     await update.message.reply_text(
         f"✅ <b>Bot activo</b>\n"
-        f"📅 Fecha: {today_str}\n"
-        f"📊 Resultados MLB bulk: {mlb_bulk_ok}\n"
+        f"📅 Fecha VZ: {today_str}\n"
+        f"📊 MLB bulk: {mlb_bulk_ok}\n"
         f"📊 Resultados otros: {len(_sent_results)}\n"
         f"📋 Lineups enviados: {len(_sent_lineups)}\n"
-        f"🍿 Juegos del día: {'✅ enviado' if _games_today_sent == today_str else '⏳ pendiente'}\n"
+        f"🍿 Juegos del día: {'✅' if _games_today_sent == today_str else '⏳'}\n"
         f"🔴 Livescores activos: {ls_active or 'ninguno'}\n"
         f"📡 Canal: {CHANNEL_ID or 'no configurado'}",
         parse_mode=ParseMode.HTML,
     )
 
 
-
-
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Muestra en crudo qué juegos encuentra la API hoy.
-    Uso: /debug  o  /debug wbc
-    """
     args      = context.args
     target    = args[0].lower() if args else "all"
     today_str = _today_vz()
     lines     = [f"🔍 <b>DEBUG — {today_str}</b>\n"]
-
     async with aiohttp.ClientSession() as session:
         fetchers = {
             "mlb":    (df.get_mlb_games,    "MLB"),
@@ -1019,8 +911,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "caribe": (df.get_caribe_games, "Caribe"),
             "wbc":    (df.get_wbc_games_auto, "WBC"),
         }
-        to_check = fetchers if target == "all" else {target: fetchers[target]} if target in fetchers else fetchers
-
+        to_check = fetchers if target == "all" else ({target: fetchers[target]} if target in fetchers else fetchers)
         for key, (fetcher, label) in to_check.items():
             try:
                 games = await fetcher(session, today_str)
@@ -1040,8 +931,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 lines.append(f"<b>{label}:</b> ERROR — {e}")
             lines.append("")
+    await update.message.reply_text("\n".join(lines)[:4000], parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
 
-    await update.message.reply_text("\n".join(lines)[:4000], parse_mode=ParseMode.HTML)
 
 # ─────────────────────────────────────────────────────────────
 #  CLASE PRINCIPAL
@@ -1068,7 +960,6 @@ class BaseballBot:
         try:
             await run_scheduler(self.app.bot)
         finally:
-            # Cancelar livescores activos al apagar
             for v in _livescore_tasks.values():
                 t = v.get("task")
                 if t and not t.done():
