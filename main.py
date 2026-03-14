@@ -11,32 +11,27 @@ logger = logging.getLogger(__name__)
 
 
 def check_env():
-    """Verifica variables obligatorias antes de arrancar."""
     missing = []
     for var in ("BOT_TOKEN", "ADMIN_ID"):
         if not os.environ.get(var):
             missing.append(var)
     if missing:
-        logger.error(f"❌ Faltan variables de entorno obligatorias: {', '.join(missing)}")
-        logger.error("   Configúralas en Render → Environment antes de deployar.")
+        logger.error(f"❌ Faltan variables de entorno: {', '.join(missing)}")
         sys.exit(1)
-
-    channel = (
-        os.environ.get("CHANNEL_ID") or
-        os.environ.get("CHANNEL_MLB") or
-        os.environ.get("CHANNEL_LVBP")
-    )
-    if not channel:
-        logger.warning("⚠️  No hay CHANNEL_ID configurado — los mensajes irán al ADMIN_ID")
+    if not (os.environ.get("CHANNEL_ID") or os.environ.get("CHANNEL_MLB")):
+        logger.warning("⚠️  No hay CHANNEL_ID — mensajes irán al ADMIN_ID")
 
 
 async def main():
     check_env()
     logger.info("⚾ Baseball Bot arrancando...")
 
-    # Importar aquí para que check_env() falle primero si faltan vars
     from bot import BaseballBot
     from server import run_server
+    import image_generator as ig
+
+    # Pre-cargar logos en background (no bloquea el arranque)
+    asyncio.create_task(ig.warm_logo_cache())
 
     bot = BaseballBot()
     await asyncio.gather(

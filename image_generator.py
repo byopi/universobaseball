@@ -429,3 +429,60 @@ async def generate_lineup_image(game_data: dict, league: str,
     img.convert("RGB").save(buf, format="JPEG", quality=93)
     buf.seek(0)
     return buf.read()
+
+
+# ─────────────────────────────────────────────────────────────
+#  PRE-CACHE DE LOGOS AL ARRANCAR
+# ─────────────────────────────────────────────────────────────
+# IDs de todos los equipos MLB (30 franquicias)
+MLB_TEAM_IDS = [
+    108, 109, 110, 111, 112, 113, 114, 115, 116, 117,
+    118, 119, 120, 121, 133, 134, 135, 136, 137, 138,
+    139, 140, 141, 142, 143, 144, 145, 146, 147, 158,
+]
+
+async def warm_logo_cache():
+    """
+    Pre-descarga en background todos los logos de MLB, logos de liga
+    y banderas de selecciones. Así las imágenes se generan más rápido.
+    """
+    import asyncio
+    logger.info("🔄 Iniciando pre-carga de logos...")
+    total = 0
+
+    async with aiohttp.ClientSession() as session:
+        # ── Logos MLB (todos los equipos) ──
+        tasks = []
+        for team_id in MLB_TEAM_IDS:
+            url = f"https://www.mlbstatic.com/team-logos/{team_id}.svg"
+            tasks.append(_download_image(url))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        loaded = sum(1 for r in results if r is not None and not isinstance(r, Exception))
+        logger.info(f"  ✅ Logos MLB: {loaded}/{len(MLB_TEAM_IDS)}")
+        total += loaded
+
+        # ── Logos de liga ──
+        for league, url in LEAGUE_LOGO_URLS.items():
+            img = await _download_image(url)
+            if img:
+                total += 1
+                logger.info(f"  ✅ Logo liga: {league}")
+            else:
+                logger.warning(f"  ⚠️ Logo liga no disponible: {league}")
+
+        # ── Banderas de selecciones ──
+        tasks = []
+        for code, url in FLAG_URLS.items():
+            tasks.append(_download_image(url))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        loaded_flags = sum(1 for r in results if r is not None and not isinstance(r, Exception))
+        logger.info(f"  ✅ Banderas: {loaded_flags}/{len(FLAG_URLS)}")
+        total += loaded_flags
+
+        # ── Watermark ──
+        wm = await _download_image(WATERMARK_URL)
+        if wm:
+            total += 1
+            logger.info("  ✅ Watermark Universo Baseball")
+
+    logger.info(f"🏁 Pre-carga completa: {total} imágenes en caché")

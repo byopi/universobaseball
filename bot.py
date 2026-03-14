@@ -44,12 +44,17 @@ GAMES_TODAY_GIF = (
     "sxciC2yS1v6ilCzz9HHvzLfOH9-MKUgASBOAMzVfuduR-Ww_UzYAlNPI9RZju1rmR4DxpURoNkmg8naEHuPABgsQd2jkk3Bq"
     "Tlb3HzbgEDtRJuioYg6R1Vy4Nwiaw-PoUmimdenyfebBnOW17N4/w665-h443/juegos-de-hoy.gif"
 )
+MLB_RESULTS_PHOTO = (
+    "https://phantom-marca-mx.unidadeditorial.es/0334222ea04d3f870bfc0cba80beb9d1"
+    "/resize/828/f/jpg/mx/assets/multimedia/imagenes/2023/09/30/16960249797044.jpg"
+)
 
 # ─── Estado en memoria ────────────────────────────────────────
 _sent_results:     set  = set()
 _sent_lineups:     set  = set()
 _bulk_state:       dict = {}       # {league: {"sent": bool, "date": str}}
 _games_today_sent: str  = ""
+_mlb_bulk_sent:    str  = ""       # fecha en que se envió el bulk de MLB
 
 # livescore activo: {game_pk: {"league": str, "last_inning": int,
 #                               "chat_id": str, "task": asyncio.Task}}
@@ -242,9 +247,54 @@ async def _build_game_data(game: dict, session: aiohttp.ClientSession) -> dict:
     }
 
 
+async def publish_mlb_results_bulk(bot: Bot, games: list,
+                                    session: aiohttp.ClientSession):
+    """
+    MLB: espera que TODOS los juegos terminen y manda un único mensaje
+    con la foto original (sin editar) + todos los resultados.
+    """
+    global _mlb_bulk_sent
+    today_str   = _today_vz()
+    if _mlb_bulk_sent == today_str:
+        return
+
+    final_games = [g for g in games if df.is_game_final(g)]
+    non_final   = [g for g in games if not df.is_game_final(g)
+                   and not df.is_game_postponed(g)]
+    if non_final:
+        logger.info(f"[MLB] Esperando {len(non_final)} juego(s) para bulk")
+        return
+    if not final_games:
+        return
+
+    _mlb_bulk_sent = today_str
+
+    lines = ["📢 | <b>FINAL DEL JUEGO</b>", ""]
+    for game in final_games:
+        away = df.get_team_info(game, "away")
+        home = df.get_team_info(game, "home")
+        lines.append(
+            f"↪️ {away['full_name']} {away['score']}-{home['score']} {home['full_name']}"
+        )
+    lines += ["", VIDEOS_LINE, "", SUBSCRIBE_LINE]
+    caption = "\n".join(lines)
+
+    channel = _channel_for("mlb")
+    try:
+        await bot.send_photo(
+            chat_id=channel,
+            photo=MLB_RESULTS_PHOTO,   # URL directa, sin descargar ni editar
+            caption=caption[:1024],
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info(f"[MLB] Bulk resultados: {len(final_games)} juego(s)")
+    except TelegramError as e:
+        logger.error(f"[MLB] Error enviando bulk: {e}")
+
+
 async def publish_result_individual(bot: Bot, game: dict, league: str,
                                      session: aiohttp.ClientSession):
-    """Publica el resultado de UN juego apenas termina."""
+    """LVBP / Caribe / WBC: publica cada juego con imagen generada apenas termina."""
     key = _game_key(game, f"result_{league}")
     if key in _sent_results:
         return
@@ -459,11 +509,10 @@ async def run_scheduler(bot: Bot):
             today_str = _today_vz()
 
             async with aiohttp.ClientSession() as session:
-                # MLB
+                # MLB — bulk cuando todos terminen
                 mlb_games = await df.get_mlb_games(session, today_str)
+                await publish_mlb_results_bulk(bot, mlb_games, session)
                 for game in mlb_games:
-                    if df.is_game_final(game):
-                        await publish_result_individual(bot, game, "mlb", session)
                     if df.is_postseason(game):
                         await publish_lineup(bot, game, "mlb", session)
                 await asyncio.sleep(5)
@@ -883,11 +932,13 @@ async def cmd_resultados(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_str = _today_vz()
     results_sent = len([k for k in _sent_results if league_key in k for league_key in ["mlb","lvbp","caribe","wbc"]])
-    ls_active = [f"#{pk} ({v['league']})" for pk, v in _livescore_tasks.items()]
+    ls_active   = [f"#{pk} ({v['league']})" for pk, v in _livescore_tasks.items()]
+    mlb_bulk_ok = "✅" if _mlb_bulk_sent == today_str else "⏳"
     await update.message.reply_text(
         f"✅ <b>Bot activo</b>\n"
         f"📅 Fecha: {today_str}\n"
-        f"📊 Resultados enviados hoy: {len(_sent_results)}\n"
+        f"📊 Resultados MLB bulk: {mlb_bulk_ok}\n"
+        f"📊 Resultados otros: {len(_sent_results)}\n"
         f"📋 Lineups enviados: {len(_sent_lineups)}\n"
         f"🍿 Juegos del día: {'✅ enviado' if _games_today_sent == today_str else '⏳ pendiente'}\n"
         f"🔴 Livescores activos: {ls_active or 'ninguno'}\n"
