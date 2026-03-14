@@ -65,7 +65,7 @@ WATERMARK_URL = (
 FLAG_URLS = {
     "DOM": "https://flagcdn.com/w160/do.png",
     "VEN": "https://flagcdn.com/w160/ve.png",
-    "PUR": "https://flagcdn.com/w160/pr.png",
+    "PUR": "https://flagcdn.com/w160/pr.png",   # Puerto Rico
     "CUB": "https://flagcdn.com/w160/cu.png",
     "MEX": "https://flagcdn.com/w160/mx.png",
     "PAN": "https://flagcdn.com/w160/pa.png",
@@ -75,6 +75,17 @@ FLAG_URLS = {
     "AUS": "https://flagcdn.com/w160/au.png",
     "ITA": "https://flagcdn.com/w160/it.png",
     "NED": "https://flagcdn.com/w160/nl.png",
+    "CAN": "https://flagcdn.com/w160/ca.png",   # Canadá (Toronto Blue Jays)
+    "NIC": "https://flagcdn.com/w160/ni.png",
+    "COL": "https://flagcdn.com/w160/co.png",
+    "BRA": "https://flagcdn.com/w160/br.png",
+    "TPE": "https://flagcdn.com/w160/tw.png",   # Chinese Taipei
+    "CHN": "https://flagcdn.com/w160/cn.png",
+    "GBR": "https://flagcdn.com/w160/gb.png",
+    "ISR": "https://flagcdn.com/w160/il.png",
+    "NZL": "https://flagcdn.com/w160/nz.png",
+    "ZAF": "https://flagcdn.com/w160/za.png",
+    "CZE": "https://flagcdn.com/w160/cz.png",
 }
 
 _img_cache: dict = {}
