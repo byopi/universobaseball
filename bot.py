@@ -717,31 +717,49 @@ async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Incluir cualquier juego que no haya terminado (Live, Preview, Scheduled, etc.)
             if df.is_game_final(g):
                 continue
-            away  = df.get_team_info(g, "away")
-            home  = df.get_team_info(g, "home")
-            label = f"{away['name']} vs {home['name']}"
-            state = g.get("status", {}).get("abstractGameState", "")
-            if df.is_game_live(g):
-                label = "🔴 " + label
-            else:
-                label = "⏳ " + label
-            candidates.append((g.get("gamePk"), label, "wbc"))
+            away     = df.get_team_info(g, "away")
+            home     = df.get_team_info(g, "home")
+            # Usar full_name si name está vacío
+            away_lbl = away["full_name"] or away["name"] or away["abbreviation"] or "Visitante"
+            home_lbl = home["full_name"] or home["name"] or home["abbreviation"] or "Local"
+            label    = f"{away_lbl} vs {home_lbl}"
+            label    = ("🔴 " if df.is_game_live(g) else "⏳ ") + label
+            pk       = g.get("gamePk") or g.get("id")
+            if pk:
+                candidates.append((pk, label, "wbc"))
+                logger.info(f"[LIVESCORE] WBC candidato: pk={pk} {label}")
+
+    logger.info(f"[LIVESCORE] Candidatos encontrados: {candidates}")
 
     if not candidates:
-        await update.message.reply_text("No hay juegos en curso o próximos ahora mismo.")
+        today_str2 = _today_vz()
+        await update.message.reply_text(
+            f"No hay juegos en curso o próximos ahora mismo.\n"
+            f"(Fecha buscada: {today_str2})\n"
+            f"Prueba /debug para ver qué encuentra la API."
+        )
         return
 
-    # Construir teclado inline
+    # Construir teclado inline — filtrar gamePk nulos
     keyboard = []
     for game_pk, label, league in candidates[:10]:
+        if not game_pk:
+            continue
+        # Asegurarse que el label no esté vacío
+        if not label.strip() or label.strip() in ("🔴 ", "⏳ "):
+            label = f"{'🔴' if '🔴' in label else '⏳'} Juego #{game_pk}"
         keyboard.append([InlineKeyboardButton(
-            label, callback_data=f"ls_{game_pk}_{league}"
+            label[:60],  # límite seguro para Telegram
+            callback_data=f"ls_{game_pk}_{league}"
         )])
-    # Botón para cancelar todos
     if _livescore_tasks:
         keyboard.append([InlineKeyboardButton(
             "⛔ Detener todos los livescores", callback_data="ls_stop_all"
         )])
+
+    if not keyboard:
+        await update.message.reply_text("No se pudieron cargar los juegos. Intenta de nuevo.")
+        return
 
     await update.message.reply_text(
         "⚾ <b>Selecciona el juego para activar el livescore al canal:</b>",
