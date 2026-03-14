@@ -506,7 +506,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/lineup — Forzar envío de alineaciones al canal\n"
         "/test — Preview de imagen de resultado\n"
         "/status — Estado del bot\n"
-        "/hoy — Seguimiento en vivo (solo en privado)",
+        "/hoy — Seguimiento en vivo (solo en privado)\n"
+        "/debug — Diagnóstico de API (qué juegos se detectan)",
         parse_mode=ParseMode.HTML,
     )
 
@@ -891,6 +892,44 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Muestra en crudo qué juegos encuentra la API hoy.
+    Solo para diagnóstico — úsalo cuando algo no funcione.
+    Uso: /debug  o  /debug wbc
+    """
+    args      = context.args
+    target    = args[0].lower() if args else "all"
+    today_str = date.today().strftime("%Y-%m-%d")
+    lines     = [f"🔍 <b>DEBUG — {today_str}</b>\n"]
+
+    async with aiohttp.ClientSession() as session:
+        fetchers = {
+            "mlb":    (df.get_mlb_games,    "MLB"),
+            "lvbp":   (df.get_lvbp_games,   "LVBP"),
+            "caribe": (df.get_caribe_games, "Caribe"),
+            "wbc":    (df.get_wbc_games_auto, "WBC"),
+        }
+        to_check = fetchers if target == "all" else {target: fetchers[target]} if target in fetchers else fetchers
+
+        for key, (fetcher, label) in to_check.items():
+            try:
+                games = await fetcher(session, today_str)
+                lines.append(f"<b>{label}:</b> {len(games)} juego(s)")
+                for g in games[:5]:
+                    away   = df.get_team_info(g, "away")
+                    home   = df.get_team_info(g, "home")
+                    status = g.get("status", {}).get("abstractGameState", "?")
+                    pk     = g.get("gamePk", "?")
+                    lines.append(f"  pk={pk} | {away['full_name']} {away['score']}-{home['score']} {home['full_name']} [{status}]")
+            except Exception as e:
+                lines.append(f"<b>{label}:</b> ERROR — {e}")
+            lines.append("")
+
+    await update.message.reply_text("\n".join(lines)[:4000], parse_mode=ParseMode.HTML)
+
 # ─────────────────────────────────────────────────────────────
 #  CLASE PRINCIPAL
 # ─────────────────────────────────────────────────────────────
@@ -905,6 +944,7 @@ class BaseballBot:
         self.app.add_handler(CommandHandler("test",       cmd_test))
         self.app.add_handler(CommandHandler("resultados", cmd_resultados))
         self.app.add_handler(CommandHandler("status",     cmd_status))
+        self.app.add_handler(CommandHandler("debug",      cmd_debug))
         self.app.add_handler(CallbackQueryHandler(cb_livescore, pattern=r"^ls_"))
 
     async def run(self):

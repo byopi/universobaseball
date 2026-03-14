@@ -1,61 +1,45 @@
 """
-data_fetcher.py — Obtiene datos de béisbol para MLB, LVBP, Serie del Caribe y WBC
-Usa MLB Stats API (gratuita, sin API key).
+data_fetcher.py — Fuentes de datos de béisbol
 
-NOTAS IMPORTANTES sobre la API:
-- El campo `fields` lo quitamos del schedule para no perder datos inesperados
-- El WBC usa múltiples sportIds según el año; probamos todos
-- La API puede demorar en reflejar resultados finales ~5 min
+MLB, LVBP, Serie del Caribe → MLB Stats API (statsapi.mlb.com)
+WBC → MLB.com scoreboard API (única fuente que lo tiene en 2026)
 """
 import aiohttp
 import logging
 from datetime import datetime, date
-
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
-MLB_API = "https://statsapi.mlb.com/api/v1"
+MLB_API      = "https://statsapi.mlb.com/api/v1"
+# API que usa MLB.com internamente para el scoreboard — funciona para WBC
+MLB_SCORE_API = "https://bdfed.stitch.mlbinfra.com/bdfed/transform-mlb-scoreboard"
 
 VZ_TZ = ZoneInfo("America/Caracas")
 ET_TZ = ZoneInfo("America/New_York")
 
-# sportId conocidos en la MLB Stats API
-SPORT_MLB    = 1    # MLB / MiLB mayor
-SPORT_LVBP   = 23   # Liga Venezolana
-SPORT_CARIBE = 22   # Serie del Caribe  (a veces 30 según el año)
-SPORT_WBC    = 51   # Torneos internacionales / WBC
 
-# leagueIds alternativos
-LEAGUE_LVBP   = 236
-LEAGUE_CARIBE = 311
-LEAGUE_WBC    = 160
-
+# ─── HTTP helper ──────────────────────────────────────────────────────────────
 
 async def fetch_json(session: aiohttp.ClientSession, url: str,
                      params: dict = None) -> dict | None:
     try:
-        async with session.get(url, params=params,
+        headers = {"User-Agent": "Mozilla/5.0 BaseballBot/1.0"}
+        async with session.get(url, params=params, headers=headers,
                                timeout=aiohttp.ClientTimeout(total=20)) as resp:
             if resp.status == 200:
                 return await resp.json(content_type=None)
-            else:
-                logger.debug(f"HTTP {resp.status} para {url} params={params}")
+            logger.debug(f"HTTP {resp.status} → {url} params={params}")
     except Exception as e:
-        logger.warning(f"Error fetching {url}: {e}")
+        logger.warning(f"fetch_json error {url}: {e}")
     return None
 
 
-async def get_schedule(session: aiohttp.ClientSession,
-                       sport_id: int = None,
-                       league_id: int = None,
-                       game_date: str = None,
-                       season: int = None,
-                       game_type: str = None) -> list:
-    """
-    Llama al endpoint /schedule de la MLB Stats API.
-    NO usa el campo `fields` para asegurarse de recibir todos los datos.
-    """
+# ─── MLB Stats API schedule (para MLB, LVBP, Caribe) ─────────────────────────
+
+async def _get_schedule_mlbapi(session: aiohttp.ClientSession,
+                                sport_id: int = None, league_id: int = None,
+                                game_date: str = None, season: int = None) -> list:
     if not game_date:
         game_date = date.today().strftime("%Y-%m-%d")
     if not season:
@@ -70,85 +54,195 @@ async def get_schedule(session: aiohttp.ClientSession,
         params["sportId"] = sport_id
     if league_id:
         params["leagueId"] = league_id
-    if game_type:
-        params["gameType"] = game_type
 
     data = await fetch_json(session, f"{MLB_API}/schedule", params)
     if not data:
-        logger.debug(f"Schedule vacío: sportId={sport_id} leagueId={league_id} date={game_date}")
         return []
-
-    dates = data.get("dates", [])
-    if not dates:
-        logger.debug(f"Cero fechas: sportId={sport_id} leagueId={league_id} date={game_date}")
-        return []
-
     games = []
-    for entry in dates:
+    for entry in data.get("dates", []):
         games.extend(entry.get("games", []))
-    logger.debug(f"Schedule: {len(games)} juego(s) | sportId={sport_id} leagueId={league_id} date={game_date}")
+    if games:
+        logger.debug(f"MLB-API: {len(games)} juego(s) sportId={sport_id} leagueId={league_id} {game_date}")
     return games
 
 
-# ─── Getters por liga ──────────────────────────────────────────────────────────
-
 async def get_mlb_games(session: aiohttp.ClientSession,
                         game_date: str = None) -> list:
-    return await get_schedule(session, sport_id=SPORT_MLB, game_date=game_date)
+    return await _get_schedule_mlbapi(session, sport_id=1, game_date=game_date)
 
 
 async def get_lvbp_games(session: aiohttp.ClientSession,
                          game_date: str = None) -> list:
-    games = await get_schedule(session, sport_id=SPORT_LVBP, game_date=game_date)
+    games = await _get_schedule_mlbapi(session, sport_id=23, game_date=game_date)
     if not games:
-        games = await get_schedule(session, league_id=LEAGUE_LVBP, game_date=game_date)
+        games = await _get_schedule_mlbapi(session, league_id=236, game_date=game_date)
     return games
 
 
 async def get_caribe_games(session: aiohttp.ClientSession,
                            game_date: str = None) -> list:
-    games = await get_schedule(session, sport_id=SPORT_CARIBE, game_date=game_date)
+    games = await _get_schedule_mlbapi(session, sport_id=22, game_date=game_date)
     if not games:
-        games = await get_schedule(session, league_id=LEAGUE_CARIBE, game_date=game_date)
+        games = await _get_schedule_mlbapi(session, league_id=311, game_date=game_date)
     return games
+
+
+# ─── WBC: scrape MLB.com scoreboard (única fuente fiable para WBC 2026) ───────
+
+def _build_wbc_game(raw: dict) -> dict:
+    """
+    Convierte un juego del scoreboard de MLB.com al formato
+    que usa el resto del bot (mismo esquema que MLB Stats API).
+    """
+    status_code = raw.get("gameStateCode", "")          # "F" = Final, "L" = Live, "S" = Scheduled
+    detailed    = raw.get("statusDisplay", "Scheduled")
+
+    abstract = "Preview"
+    if status_code == "F":
+        abstract = "Final"
+    elif status_code in ("L", "I"):     # Live / In progress
+        abstract = "Live"
+
+    away = raw.get("away", {})
+    home = raw.get("home", {})
+
+    away_name = away.get("teamName", away.get("name", ""))
+    home_name = home.get("teamName", home.get("name", ""))
+    away_full = away.get("teamFullName", away_name)
+    home_full = home.get("teamFullName", home_name)
+
+    linescore = {}
+    linescore_raw = raw.get("linescore", {})
+    if linescore_raw:
+        linescore = {
+            "currentInning":        linescore_raw.get("currentInning", 0),
+            "currentInningOrdinal": linescore_raw.get("currentInningOrdinal", ""),
+            "inningHalf":           linescore_raw.get("inningHalf", ""),
+        }
+
+    # Decisiones de pitching
+    decisions = {}
+    if raw.get("winningPitcher"):
+        decisions["winner"] = {"fullName": raw["winningPitcher"].get("fullName", "")}
+    if raw.get("losingPitcher"):
+        decisions["loser"]  = {"fullName": raw["losingPitcher"].get("fullName", "")}
+    if raw.get("savePitcher"):
+        decisions["save"]   = {"fullName": raw["savePitcher"].get("fullName", "")}
+
+    return {
+        "gamePk":   raw.get("gamePk") or raw.get("id"),
+        "gameDate": raw.get("gameDate", ""),
+        "gameType": raw.get("gameType", "C"),     # C = Classic
+        "status": {
+            "abstractGameState": abstract,
+            "detailedState":     detailed,
+        },
+        "teams": {
+            "away": {
+                "score": away.get("runs", 0) or 0,
+                "team": {
+                    "id":           away.get("id"),
+                    "name":         away_full,
+                    "teamName":     away_name,
+                    "abbreviation": away.get("abbreviation", ""),
+                },
+            },
+            "home": {
+                "score": home.get("runs", 0) or 0,
+                "team": {
+                    "id":           home.get("id"),
+                    "name":         home_full,
+                    "teamName":     home_name,
+                    "abbreviation": home.get("abbreviation", ""),
+                },
+            },
+        },
+        "linescore": linescore,
+        "decisions": decisions,
+        "_source": "wbc_scoreboard",
+    }
 
 
 async def get_wbc_games_auto(session: aiohttp.ClientSession,
                              game_date: str = None) -> list:
     """
-    Busca juegos WBC probando varios sportIds y leagueIds.
-    La API de MLB Stats indexa el WBC con distintos IDs según el año.
-    Probamos todos los que conocemos, del más probable al menos probable.
+    Obtiene los juegos del WBC desde el scoreboard de MLB.com.
+    Funciona para WBC 2023, 2026 y futuros.
     """
     if not game_date:
         game_date = date.today().strftime("%Y-%m-%d")
-    year = int(game_date[:4])
 
-    # Orden de búsqueda: de más probable a menos
-    attempts = [
-        {"sport_id": 51,  "season": year},    # International tournaments
-        {"sport_id": 51,  "season": year, "game_type": "C"},  # Classic
-        {"league_id": 160, "season": year},   # WBC league id histórico
-        {"sport_id": 22,  "season": year},    # Caribbean / international
-        {"sport_id": 51,  "season": 2023},    # WBC 2023 (fallback histórico)
-        {"league_id": 160, "season": 2023},
+    # ── Método 1: stitch MLB scoreboard (lo usa mlb.com en su web) ──
+    # Soporta WBC filtrando por sportId=51 o leagueId=160
+    for sport_id in (51, 22):
+        params = {
+            "sportId":  sport_id,
+            "startDate": game_date,
+            "endDate":   game_date,
+            "season":    game_date[:4],
+            "hydrate":   "team,linescore,decisions",
+        }
+        data = await fetch_json(session, f"{MLB_API}/schedule", params)
+        if data:
+            games = []
+            for entry in data.get("dates", []):
+                games.extend(entry.get("games", []))
+            if games:
+                logger.info(f"WBC vía MLB-API sportId={sport_id}: {len(games)} juego(s)")
+                return games
+
+    # ── Método 2: MLB.com scoreboard endpoint (más fiable para WBC) ──
+    urls_to_try = [
+        # API interna de mlb.com
+        f"https://bdfed.stitch.mlbinfra.com/bdfed/transform-mlb-scoreboard?stitch_env=prod&season={game_date[:4]}&sportId=51&startDate={game_date}&endDate={game_date}&gameType=C&language=en",
+        f"https://bdfed.stitch.mlbinfra.com/bdfed/transform-mlb-scoreboard?stitch_env=prod&season={game_date[:4]}&sportId=51&startDate={game_date}&endDate={game_date}&language=en",
+        # Endpoint de schedule público sin filtro restrictivo
+        f"{MLB_API}/schedule?sportId=51&season={game_date[:4]}&date={game_date}",
+        f"{MLB_API}/schedule?leagueId=160&season={game_date[:4]}&date={game_date}",
     ]
 
-    for attempt in attempts:
-        games = await get_schedule(session, game_date=game_date, **attempt)
+    for url in urls_to_try:
+        data = await fetch_json(session, url)
+        if not data:
+            continue
+
+        # Si la respuesta tiene formato stitch (scoreboard)
+        if "dates" not in data and ("gamesByDate" in data or isinstance(data.get("games"), list)):
+            raw_games = data.get("games", [])
+            if raw_games:
+                games = [_build_wbc_game(g) for g in raw_games]
+                logger.info(f"WBC vía stitch: {len(games)} juego(s)")
+                return games
+
+        # Formato estándar
+        games_found = []
+        for entry in data.get("dates", []):
+            games_found.extend(entry.get("games", []))
+        if games_found:
+            logger.info(f"WBC vía {url[:60]}: {len(games_found)} juego(s)")
+            return games_found
+
+    # ── Método 3: MLB Stats API con múltiples combinaciones ──
+    combos = [
+        {"sport_id": 51,  "season": int(game_date[:4])},
+        {"league_id": 160, "season": int(game_date[:4])},
+        {"sport_id": 51,  "season": 2023},
+        {"league_id": 160, "season": 2023},
+    ]
+    for combo in combos:
+        games = await _get_schedule_mlbapi(session, game_date=game_date, **combo)
         if games:
-            logger.info(f"WBC encontrado: {len(games)} juego(s) con params={attempt}")
+            logger.info(f"WBC vía combo {combo}: {len(games)} juego(s)")
             return games
 
-    logger.debug(f"WBC: ningún juego encontrado para {game_date}")
+    logger.debug(f"WBC: sin juegos para {game_date}")
     return []
 
 
-# ─── Helpers de estado de juego ────────────────────────────────────────────────
+# ─── Helpers de estado ────────────────────────────────────────────────────────
 
 def is_game_final(game: dict) -> bool:
-    status = game.get("status", {})
-    # Verificar tanto el estado abstracto como el detailedState
+    status   = game.get("status", {})
     abstract = status.get("abstractGameState", "")
     detailed = status.get("detailedState", "")
     return abstract == "Final" or detailed in ("Final", "Game Over", "Completed Early")
@@ -171,17 +265,13 @@ def is_postseason(game: dict) -> bool:
     return game.get("gameType", "") in ("D", "L", "W", "F")
 
 
-# ─── Extracción de datos ───────────────────────────────────────────────────────
+# ─── Extracción de datos del juego ────────────────────────────────────────────
 
 def get_team_info(game: dict, side: str) -> dict:
-    """side = 'away' | 'home'"""
     teams     = game.get("teams", {})
     team_data = teams.get(side, {})
     team      = team_data.get("team", {})
-    # Intentar obtener el nombre de varias formas
-    name = (team.get("teamName")
-            or team.get("clubName")
-            or team.get("name", ""))
+    name      = (team.get("teamName") or team.get("clubName") or team.get("name", ""))
     full_name = team.get("name", name)
     return {
         "id":           team.get("id"),
@@ -211,7 +301,7 @@ def get_lineup_from_game(game: dict) -> dict:
     }
 
 
-# ─── Boxscore y linescore ──────────────────────────────────────────────────────
+# ─── Boxscore y linescore ─────────────────────────────────────────────────────
 
 async def get_game_boxscore(session: aiohttp.ClientSession, game_pk: int) -> dict:
     data = await fetch_json(session, f"{MLB_API}/game/{game_pk}/boxscore")
@@ -220,10 +310,4 @@ async def get_game_boxscore(session: aiohttp.ClientSession, game_pk: int) -> dic
 
 async def get_game_linescore(session: aiohttp.ClientSession, game_pk: int) -> dict:
     data = await fetch_json(session, f"{MLB_API}/game/{game_pk}/linescore")
-    return data or {}
-
-
-async def get_game_feed(session: aiohttp.ClientSession, game_pk: int) -> dict:
-    """Feed completo del juego — más datos pero más lento."""
-    data = await fetch_json(session, f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
     return data or {}
