@@ -373,57 +373,74 @@ async def publish_lineup(bot: Bot, game: dict, league: str,
 # ─────────────────────────────────────────────────────────────
 #  LIVESCORE — actualiza por inning, publica al canal
 # ─────────────────────────────────────────────────────────────
+async def _fetch_game_obj(session: aiohttp.ClientSession,
+                          game_pk: int, league: str) -> dict | None:
+    """
+    Obtiene el objeto juego actualizado según la liga.
+    Para WBC usa get_wbc_games_auto; para el resto usa MLB Stats API directamente.
+    """
+    if league == "wbc":
+        # WBC: buscar en la lista de juegos del día y filtrar por gamePk
+        today  = _today_vz()
+        games  = await df.get_wbc_games_auto(session, today)
+        for g in games:
+            if g.get("gamePk") == game_pk:
+                return g
+        # También intentar ayer por desfase horario
+        from datetime import timedelta
+        yesterday = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        games = await df.get_wbc_games_auto(session, yesterday)
+        for g in games:
+            if g.get("gamePk") == game_pk:
+                return g
+        return None
+    else:
+        # MLB/LVBP/Caribe: usar endpoint directo por gamePk
+        data = await df.fetch_json(
+            session,
+            "https://statsapi.mlb.com/api/v1/schedule",
+            {"gamePk": game_pk, "hydrate": "linescore,decisions,team"}
+        )
+        if data and data.get("dates"):
+            for d in data["dates"]:
+                for g in d.get("games", []):
+                    if g.get("gamePk") == game_pk:
+                        return g
+        return None
+
+
 async def _livescore_loop(bot: Bot, game_pk: int, league: str, chat_id: str):
     """
     Monitorea un juego y publica al canal cada vez que cambia el inning.
-    Formato:
-        ❗️ | LIVESCORE (bold)
-
-        Equipo X-X Equipo (bold)
-
-        ➡️ Inning N°
-
-        📲 Suscribete... (bold)
+    Soporta MLB, LVBP, Caribe y WBC usando la fuente correcta para cada liga.
     """
-    logger.info(f"[LIVESCORE] Iniciando para gamePk={game_pk}")
-    last_inning = -1
+    logger.info(f"[LIVESCORE] Iniciando gamePk={game_pk} liga={league}")
+    last_inning        = -1
     consecutive_errors = 0
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
+                game_obj  = await _fetch_game_obj(session, game_pk, league)
                 linescore = await df.get_game_linescore(session, game_pk)
-                schedule  = await df.fetch_json(
-                    session,
-                    f"https://statsapi.mlb.com/api/v1/schedule",
-                    {"gamePk": game_pk, "hydrate": "linescore,decisions"}
-                )
-
-            # Extraer datos del juego
-            game_obj = None
-            if schedule and schedule.get("dates"):
-                for d in schedule["dates"]:
-                    for g in d.get("games", []):
-                        if g.get("gamePk") == game_pk:
-                            game_obj = g
-                            break
 
             if not game_obj:
                 consecutive_errors += 1
-                if consecutive_errors > 5:
-                    logger.warning(f"[LIVESCORE] gamePk={game_pk} no encontrado, cancelando")
+                if consecutive_errors > 8:
+                    logger.warning(f"[LIVESCORE] gamePk={game_pk} no encontrado tras 8 intentos, cancelando")
                     break
+                logger.debug(f"[LIVESCORE] gamePk={game_pk} no encontrado (intento {consecutive_errors})")
                 await asyncio.sleep(60)
                 continue
 
             consecutive_errors = 0
+            away   = df.get_team_info(game_obj, "away")
+            home   = df.get_team_info(game_obj, "home")
             status = game_obj.get("status", {}).get("abstractGameState", "")
 
-            # Juego terminó — publicar resultado final y parar
-            if status == "Final":
-                away = df.get_team_info(game_obj, "away")
-                home = df.get_team_info(game_obj, "home")
-                innings = linescore.get("currentInning", 9)
+            # ── Juego terminado ──
+            if df.is_game_final(game_obj):
+                innings = linescore.get("currentInning", 9) if linescore else 9
                 text = (
                     "❗️ | <b>LIVESCORE</b>\n\n"
                     f"<b>{away['full_name']} {away['score']}-{home['score']} {home['full_name']}</b>\n\n"
@@ -434,18 +451,19 @@ async def _livescore_loop(bot: Bot, game_pk: int, league: str, chat_id: str):
                 logger.info(f"[LIVESCORE] gamePk={game_pk} finalizado")
                 break
 
-            # Solo publicar si cambió el inning
-            if status == "Live":
-                current_inning = linescore.get("currentInning", 0)
-                inning_half    = linescore.get("inningHalf", "")   # "Top" / "Bottom"
-                inning_ordinal = linescore.get("currentInningOrdinal", f"#{current_inning}")
+            # ── Juego en vivo: publicar si cambió el inning ──
+            if df.is_game_live(game_obj):
+                # Linescore del game_obj embebido (más fiable para WBC)
+                ls_embedded = game_obj.get("linescore", {})
+                ls_data     = ls_embedded if ls_embedded else linescore or {}
+
+                current_inning = ls_data.get("currentInning", 0)
+                inning_half    = ls_data.get("inningHalf", "")
+                inning_ordinal = ls_data.get("currentInningOrdinal", f"#{current_inning}")
 
                 if current_inning != last_inning and current_inning > 0:
                     last_inning = current_inning
-                    away = df.get_team_info(game_obj, "away")
-                    home = df.get_team_info(game_obj, "home")
-
-                    half_str = "▲" if inning_half == "Top" else "▼"
+                    half_str = "▲" if inning_half in ("Top", "top") else "▼"
                     text = (
                         "❗️ | <b>LIVESCORE</b>\n\n"
                         f"<b>{away['full_name']} {away['score']}-{home['score']} {home['full_name']}</b>\n\n"
@@ -453,17 +471,16 @@ async def _livescore_loop(bot: Bot, game_pk: int, league: str, chat_id: str):
                         f"{SUBSCRIBE_LINE_BOLD}"
                     )
                     await _send_message(bot, chat_id, text)
-                    logger.info(f"[LIVESCORE] gamePk={game_pk} inning {inning_ordinal}")
+                    logger.info(f"[LIVESCORE] {game_pk} inning {half_str}{inning_ordinal} | {away['score']}-{home['score']}")
 
         except asyncio.CancelledError:
             logger.info(f"[LIVESCORE] gamePk={game_pk} cancelado")
             break
         except Exception as e:
-            logger.error(f"[LIVESCORE] Error gamePk={game_pk}: {e}")
+            logger.error(f"[LIVESCORE] Error gamePk={game_pk}: {e}", exc_info=True)
 
-        await asyncio.sleep(90)   # revisar cada 90 segundos
+        await asyncio.sleep(90)
 
-    # Limpiar del registro
     _livescore_tasks.pop(game_pk, None)
 
 
