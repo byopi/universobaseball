@@ -7,7 +7,7 @@ import io
 import asyncio
 import logging
 import aiohttp
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -421,20 +421,51 @@ async def _livescore_loop(bot: Bot, game_pk: int, league: str, chat_id: str):
 
 # ─────────────────────────────────────────────────────────────
 #  SCHEDULER
+#  - Juegos del día: se publica exactamente a las 00:00 UTC-4
+#  - Resultados / lineups: se revisan cada 5 minutos
 # ─────────────────────────────────────────────────────────────
+def _seconds_until_midnight_vz() -> float:
+    """Segundos que faltan para las 00:00 en UTC-4 (Venezuela/Caracas)."""
+    now_vz    = datetime.now(VZ_TZ)
+    tomorrow  = (now_vz + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+    return (tomorrow - now_vz).total_seconds()
+
+
 async def run_scheduler(bot: Bot):
     logger.info("Scheduler iniciado ✅")
+
+    # ── Tarea de juegos del día: duerme hasta las 00:00 VZ y publica ──
+    async def _games_today_loop():
+        while True:
+            now_vz = datetime.now(VZ_TZ)
+            # Si ya pasaron las 00:00 de hoy y aún no se ha enviado,
+            # publicar de inmediato (útil en el primer arranque del día).
+            # Si ya se envió, esperar a la medianoche de mañana.
+            if _games_today_sent != date.today().strftime("%Y-%m-%d"):
+                # Todavía no enviado hoy — publicar ahora
+                try:
+                    date_display = now_vz.strftime("%d de %B de %Y")
+                    async with aiohttp.ClientSession() as s:
+                        await publish_all_games_today(bot, date_display, s)
+                except Exception as e:
+                    logger.error(f"[games_today] Error: {e}", exc_info=True)
+
+            # Dormir hasta la próxima medianoche VZ
+            secs = _seconds_until_midnight_vz()
+            logger.info(f"[games_today] Próxima publicación en {secs/3600:.1f}h (00:00 VZ)")
+            await asyncio.sleep(secs + 5)   # +5s de margen
+
+    # Lanzar la tarea de medianoche en paralelo
+    asyncio.create_task(_games_today_loop())
+
+    # ── Loop principal: resultados + lineups cada 5 minutos ──
     while True:
         try:
-            today_str    = date.today().strftime("%Y-%m-%d")
-            date_display = datetime.now(ET_TZ).strftime("%d de %B de %Y")
+            today_str = date.today().strftime("%Y-%m-%d")
 
             async with aiohttp.ClientSession() as session:
-                # 1. Juegos del día — un solo post con todas las ligas
-                await publish_all_games_today(bot, date_display, session)
-                await asyncio.sleep(3)
-
-                # 2. MLB
+                # MLB
                 mlb_games = await df.get_mlb_games(session, today_str)
                 await publish_results_bulk(bot, mlb_games, "mlb", session)
                 for game in mlb_games:
@@ -442,21 +473,21 @@ async def run_scheduler(bot: Bot):
                         await publish_lineup(bot, game, "mlb", session)
                 await asyncio.sleep(5)
 
-                # 3. LVBP
+                # LVBP
                 lvbp_games = await df.get_lvbp_games(session, today_str)
                 await publish_results_bulk(bot, lvbp_games, "lvbp", session)
                 for game in lvbp_games:
                     await publish_lineup(bot, game, "lvbp", session)
                 await asyncio.sleep(5)
 
-                # 4. Caribe
+                # Caribe
                 caribe_games = await df.get_caribe_games(session, today_str)
                 await publish_results_bulk(bot, caribe_games, "caribe", session)
                 for game in caribe_games:
                     await publish_lineup(bot, game, "caribe", session)
                 await asyncio.sleep(5)
 
-                # 5. WBC
+                # WBC
                 wbc_games = await df.get_wbc_games_auto(session, today_str)
                 await publish_results_bulk(bot, wbc_games, "wbc", session)
                 for game in wbc_games:
