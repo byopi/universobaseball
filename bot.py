@@ -992,7 +992,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Muestra en crudo qué juegos encuentra la API hoy.
-    Solo para diagnóstico — úsalo cuando algo no funcione.
     Uso: /debug  o  /debug wbc
     """
     args      = context.args
@@ -1014,11 +1013,17 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 games = await fetcher(session, today_str)
                 lines.append(f"<b>{label}:</b> {len(games)} juego(s)")
                 for g in games[:5]:
-                    away   = df.get_team_info(g, "away")
-                    home   = df.get_team_info(g, "home")
-                    status = g.get("status", {}).get("abstractGameState", "?")
-                    pk     = g.get("gamePk", "?")
-                    lines.append(f"  pk={pk} | {away['full_name']} {away['score']}-{home['score']} {home['full_name']} [{status}]")
+                    away     = df.get_team_info(g, "away")
+                    home     = df.get_team_info(g, "home")
+                    status   = g.get("status", {})
+                    abstract = status.get("abstractGameState", "?")
+                    detailed = status.get("detailedState", "?")
+                    pk       = g.get("gamePk", "?")
+                    is_fin   = df.is_game_final(g)
+                    lines.append(
+                        f"  pk={pk} | {away['full_name']} {away['score']}-{home['score']} {home['full_name']}\n"
+                        f"    abstract={abstract} detailed={detailed} is_final={is_fin}"
+                    )
             except Exception as e:
                 lines.append(f"<b>{label}:</b> ERROR — {e}")
             lines.append("")
