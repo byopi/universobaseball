@@ -8,6 +8,10 @@ import asyncio
 import logging
 import aiohttp
 from datetime import datetime, date, timedelta
+
+def _today_vz() -> str:
+    """Fecha actual en Venezuela (UTC-4) — referencia para todos los juegos."""
+    return datetime.now(VZ_TZ).strftime("%Y-%m-%d")
 from zoneinfo import ZoneInfo
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -154,7 +158,7 @@ async def _send_message(bot: Bot, chat_id: str, text: str):
 async def publish_all_games_today(bot: Bot, date_str: str,
                                    session: aiohttp.ClientSession):
     global _games_today_sent
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     if _games_today_sent == today_str:
         return
 
@@ -452,7 +456,7 @@ async def run_scheduler(bot: Bot):
     # ── Loop principal: resultados + lineups cada 5 minutos ──
     while True:
         try:
-            today_str = date.today().strftime("%Y-%m-%d")
+            today_str = _today_vz()
 
             async with aiohttp.ClientSession() as session:
                 # MLB
@@ -513,7 +517,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_juegos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     lines     = ["🍿 ¡JUEGOS DE HOY! ⚾️", ""]
     found_any = False
 
@@ -566,7 +570,7 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Este comando solo funciona en privado para no spamear el canal."
         )
         return
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     lines     = [f"🔴 <b>EN VIVO — {date.today().strftime('%d/%m/%Y')}</b>\n"]
     async with aiohttp.ClientSession() as session:
         for label, fetcher, emoji, tz in [
@@ -619,7 +623,7 @@ async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Muestra los juegos en curso/próximos con botones.
     El usuario selecciona uno y el bot inicia el livescore al canal.
     """
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     candidates = []   # (game_pk, label, league)
 
     async with aiohttp.ClientSession() as session:
@@ -714,7 +718,7 @@ async def cb_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_lineup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_str  = date.today().strftime("%Y-%m-%d")
+    today_str  = _today_vz()
     sent_count = 0
     async with aiohttp.ClientSession() as session:
         for league, fetcher in [
@@ -757,7 +761,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Uso: /test mlb|lvbp|caribe|wbc")
         return
 
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     game_data = None
 
     await update.message.reply_text("🔄 Buscando juego finalizado...")
@@ -834,7 +838,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_resultados(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     lines     = ["📢 | <b>RESULTADOS DE HOY</b>\n"]
     found_any = False
     async with aiohttp.ClientSession() as session:
@@ -877,7 +881,7 @@ async def cmd_resultados(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     results_sent = len([k for k in _sent_results if league_key in k for league_key in ["mlb","lvbp","caribe","wbc"]])
     ls_active = [f"#{pk} ({v['league']})" for pk, v in _livescore_tasks.items()]
     await update.message.reply_text(
@@ -902,7 +906,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     args      = context.args
     target    = args[0].lower() if args else "all"
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = _today_vz()
     lines     = [f"🔍 <b>DEBUG — {today_str}</b>\n"]
 
     async with aiohttp.ClientSession() as session:

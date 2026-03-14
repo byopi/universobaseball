@@ -166,76 +166,59 @@ def _build_wbc_game(raw: dict) -> dict:
 async def get_wbc_games_auto(session: aiohttp.ClientSession,
                              game_date: str = None) -> list:
     """
-    Obtiene los juegos del WBC desde el scoreboard de MLB.com.
-    Funciona para WBC 2023, 2026 y futuros.
+    Obtiene los juegos del WBC.
+    Busca en la fecha VZ actual Y en el día anterior (por desfase UTC).
     """
+    from datetime import timedelta
     if not game_date:
-        game_date = date.today().strftime("%Y-%m-%d")
+        # Usar fecha en Venezuela (UTC-4) como referencia
+        game_date = datetime.now(VZ_TZ).strftime("%Y-%m-%d")
 
-    # ── Método 1: stitch MLB scoreboard (lo usa mlb.com en su web) ──
-    # Soporta WBC filtrando por sportId=51 o leagueId=160
-    for sport_id in (51, 22):
-        params = {
-            "sportId":  sport_id,
-            "startDate": game_date,
-            "endDate":   game_date,
-            "season":    game_date[:4],
-            "hydrate":   "team,linescore,decisions",
-        }
-        data = await fetch_json(session, f"{MLB_API}/schedule", params)
-        if data:
-            games = []
-            for entry in data.get("dates", []):
-                games.extend(entry.get("games", []))
-            if games:
-                logger.info(f"WBC vía MLB-API sportId={sport_id}: {len(games)} juego(s)")
-                return games
+    # También buscar el día anterior en caso de desfase UTC
+    prev_date = (datetime.strptime(game_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    dates_to_try = [game_date, prev_date]
 
-    # ── Método 2: MLB.com scoreboard endpoint (más fiable para WBC) ──
-    urls_to_try = [
-        # API interna de mlb.com
-        f"https://bdfed.stitch.mlbinfra.com/bdfed/transform-mlb-scoreboard?stitch_env=prod&season={game_date[:4]}&sportId=51&startDate={game_date}&endDate={game_date}&gameType=C&language=en",
-        f"https://bdfed.stitch.mlbinfra.com/bdfed/transform-mlb-scoreboard?stitch_env=prod&season={game_date[:4]}&sportId=51&startDate={game_date}&endDate={game_date}&language=en",
-        # Endpoint de schedule público sin filtro restrictivo
-        f"{MLB_API}/schedule?sportId=51&season={game_date[:4]}&date={game_date}",
-        f"{MLB_API}/schedule?leagueId=160&season={game_date[:4]}&date={game_date}",
-    ]
+    # Intentar cada fecha (hoy y ayer en VZ)
+    for try_date in dates_to_try:
+        year = try_date[:4]
 
-    for url in urls_to_try:
-        data = await fetch_json(session, url)
-        if not data:
-            continue
+        # ── Método 1: MLB Stats API con sportId=51 ──
+        for sport_id in (51, 22):
+            params = {
+                "sportId":   sport_id,
+                "startDate": try_date,
+                "endDate":   try_date,
+                "season":    year,
+                "hydrate":   "team,linescore,decisions",
+            }
+            data = await fetch_json(session, f"{MLB_API}/schedule", params)
+            if data:
+                games = []
+                for entry in data.get("dates", []):
+                    games.extend(entry.get("games", []))
+                if games:
+                    logger.info(f"WBC {try_date} sportId={sport_id}: {len(games)} juego(s)")
+                    return games
 
-        # Si la respuesta tiene formato stitch (scoreboard)
-        if "dates" not in data and ("gamesByDate" in data or isinstance(data.get("games"), list)):
-            raw_games = data.get("games", [])
-            if raw_games:
-                games = [_build_wbc_game(g) for g in raw_games]
-                logger.info(f"WBC vía stitch: {len(games)} juego(s)")
-                return games
+        # ── Método 2: leagueId=160 ──
+        for league_id in (160,):
+            params = {
+                "leagueId":  league_id,
+                "startDate": try_date,
+                "endDate":   try_date,
+                "season":    year,
+                "hydrate":   "team,linescore,decisions",
+            }
+            data = await fetch_json(session, f"{MLB_API}/schedule", params)
+            if data:
+                games = []
+                for entry in data.get("dates", []):
+                    games.extend(entry.get("games", []))
+                if games:
+                    logger.info(f"WBC {try_date} leagueId={league_id}: {len(games)} juego(s)")
+                    return games
 
-        # Formato estándar
-        games_found = []
-        for entry in data.get("dates", []):
-            games_found.extend(entry.get("games", []))
-        if games_found:
-            logger.info(f"WBC vía {url[:60]}: {len(games_found)} juego(s)")
-            return games_found
-
-    # ── Método 3: MLB Stats API con múltiples combinaciones ──
-    combos = [
-        {"sport_id": 51,  "season": int(game_date[:4])},
-        {"league_id": 160, "season": int(game_date[:4])},
-        {"sport_id": 51,  "season": 2023},
-        {"league_id": 160, "season": 2023},
-    ]
-    for combo in combos:
-        games = await _get_schedule_mlbapi(session, game_date=game_date, **combo)
-        if games:
-            logger.info(f"WBC vía combo {combo}: {len(games)} juego(s)")
-            return games
-
-    logger.debug(f"WBC: sin juegos para {game_date}")
+    logger.debug(f"WBC: sin juegos para {dates_to_try}")
     return []
 
 
