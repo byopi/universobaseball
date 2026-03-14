@@ -62,6 +62,14 @@ WATERMARK_URL = (
     "EeqCWcDjIqRRj2gTkYiAeeXGR12dXpkWAvPpuet5iPs0eO2uc/s1024/universobaseball.jpg"
 )
 
+# Logos de liga — se muestran en la parte superior de la imagen
+LEAGUE_LOGO_URLS = {
+    "mlb":    "https://www.mlbstatic.com/team-logos/league-on-dark/1.svg",
+    "lvbp":   "https://upload.wikimedia.org/wikipedia/en/thumb/3/39/LVBP_logo.png/250px-LVBP_logo.png",
+    "caribe": "https://upload.wikimedia.org/wikipedia/en/thumb/2/28/Caribbean_Series_logo.png/250px-Caribbean_Series_logo.png",
+    "wbc":    "https://upload.wikimedia.org/wikipedia/en/thumb/7/7c/World_Baseball_Classic_logo.svg/250px-World_Baseball_Classic_logo.svg.png",
+}
+
 FLAG_URLS = {
     "DOM": "https://flagcdn.com/w160/do.png",
     "VEN": "https://flagcdn.com/w160/ve.png",
@@ -157,6 +165,20 @@ async def _get_logo(game_data: dict, side: str, size: tuple) -> "Image.Image | N
     return None
 
 
+async def _get_league_logo(league: str, height: int = 40) -> "Image.Image | None":
+    """Descarga el logo de la liga y lo redimensiona al height dado."""
+    url = LEAGUE_LOGO_URLS.get(league)
+    if not url:
+        return None
+    img = await _download_image(url)
+    if img is None:
+        return None
+    # Mantener proporción
+    w, h = img.size
+    new_w = int(w * height / h)
+    return img.resize((new_w, height), Image.LANCZOS).convert("RGBA")
+
+
 async def _apply_watermark(img: Image.Image) -> Image.Image:
     """Watermark centrado, pequeño y sutil."""
     wm = await _download_image(WATERMARK_URL)
@@ -228,10 +250,20 @@ async def generate_final_result_image(game_data: dict, league: str) -> bytes:
     draw.rounded_rectangle([2, 2, W - 3, H - 3], radius=18,
                            outline=border, width=2)
 
-    # ── Liga centrada arriba ──
-    draw.line([(W // 2 - 140, 30), (W // 2 + 140, 30)], fill=border, width=1)
-    draw.text((W // 2, 52), label, font=font_league, fill=accent, anchor="mm")
-    draw.line([(W // 2 - 140, 72), (W // 2 + 140, 72)], fill=border, width=1)
+    # ── Liga centrada arriba: logo + texto ──
+    league_logo = await _get_league_logo(league, height=36)
+    header_y = 52
+    draw.line([(W // 2 - 160, 22), (W // 2 + 160, 22)], fill=border, width=1)
+    if league_logo:
+        lx = W // 2 - league_logo.width // 2
+        ly = header_y - league_logo.height // 2 - 2
+        try:
+            img.paste(league_logo, (lx, ly), league_logo)
+        except Exception:
+            draw.text((W // 2, header_y), label, font=font_league, fill=accent, anchor="mm")
+    else:
+        draw.text((W // 2, header_y), label, font=font_league, fill=accent, anchor="mm")
+    draw.line([(W // 2 - 160, 78), (W // 2 + 160, 78)], fill=border, width=1)
 
     # ── Logos ──
     logo_size    = (160, 160)
@@ -340,10 +372,18 @@ async def generate_lineup_image(game_data: dict, league: str,
     draw.rounded_rectangle([2, 2, W - 3, H - 3], radius=14,
                            outline=border, width=2)
 
-    # Liga
-    draw.line([(W // 2 - 140, 18), (W // 2 + 140, 18)], fill=border, width=1)
-    draw.text((W // 2, 38), label, font=font_header, fill=accent, anchor="mm")
-    draw.line([(W // 2 - 140, 58), (W // 2 + 140, 58)], fill=border, width=1)
+    # Liga: logo + texto
+    league_logo = await _get_league_logo(league, height=32)
+    draw.line([(W // 2 - 160, 12), (W // 2 + 160, 12)], fill=border, width=1)
+    if league_logo:
+        lx = W // 2 - league_logo.width // 2
+        try:
+            img.paste(league_logo, (lx, 18), league_logo)
+        except Exception:
+            draw.text((W // 2, 38), label, font=font_header, fill=accent, anchor="mm")
+    else:
+        draw.text((W // 2, 38), label, font=font_header, fill=accent, anchor="mm")
+    draw.line([(W // 2 - 160, 56), (W // 2 + 160, 56)], fill=border, width=1)
 
     # Cabeceras de columna
     away_name = game_data.get("away_name", "Visitante").upper()
