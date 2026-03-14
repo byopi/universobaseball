@@ -697,37 +697,46 @@ async def cmd_livescore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     candidates = []   # (game_pk, label, league)
 
     async with aiohttp.ClientSession() as session:
+        # MLB / LVBP / Caribe
         for league, fetcher in [
             ("mlb",    df.get_mlb_games),
             ("lvbp",   df.get_lvbp_games),
             ("caribe", df.get_caribe_games),
         ]:
-            games = await fetcher(session, today_str)
-            for g in games:
-                if df.is_game_final(g):
-                    continue
-                away  = df.get_team_info(g, "away")
-                home  = df.get_team_info(g, "home")
-                label = f"{away['abbreviation'] or away['name']} vs {home['abbreviation'] or home['name']}"
-                label = ("🔴 " if df.is_game_live(g) else "⏳ ") + label
-                candidates.append((g.get("gamePk"), label, league))
+            try:
+                games = await fetcher(session, today_str)
+                for g in games:
+                    if df.is_game_final(g):
+                        continue
+                    away  = df.get_team_info(g, "away")
+                    home  = df.get_team_info(g, "home")
+                    lbl   = (away["abbreviation"] or away["name"]) + " vs " + (home["abbreviation"] or home["name"])
+                    lbl   = ("🔴 " if df.is_game_live(g) else "⏳ ") + lbl
+                    pk    = g.get("gamePk")
+                    if pk:
+                        candidates.append((pk, lbl, league))
+            except Exception as e:
+                logger.error(f"[LIVESCORE] Error fetching {league}: {e}")
 
-        wbc = await df.get_wbc_games_auto(session, today_str)
-        for g in wbc:
-            # Incluir cualquier juego que no haya terminado (Live, Preview, Scheduled, etc.)
-            if df.is_game_final(g):
-                continue
-            away     = df.get_team_info(g, "away")
-            home     = df.get_team_info(g, "home")
-            # Usar full_name si name está vacío
-            away_lbl = away["full_name"] or away["name"] or away["abbreviation"] or "Visitante"
-            home_lbl = home["full_name"] or home["name"] or home["abbreviation"] or "Local"
-            label    = f"{away_lbl} vs {home_lbl}"
-            label    = ("🔴 " if df.is_game_live(g) else "⏳ ") + label
-            pk       = g.get("gamePk") or g.get("id")
-            if pk:
-                candidates.append((pk, label, "wbc"))
-                logger.info(f"[LIVESCORE] WBC candidato: pk={pk} {label}")
+        # WBC — sesión propia para aislar errores
+        try:
+            wbc = await df.get_wbc_games_auto(session, today_str)
+            logger.info(f"[LIVESCORE] WBC juegos encontrados: {len(wbc)}")
+            for g in wbc:
+                if df.is_game_final(g):
+                    logger.info(f"[LIVESCORE] WBC pk={g.get('gamePk')} saltado (final)")
+                    continue
+                away     = df.get_team_info(g, "away")
+                home     = df.get_team_info(g, "home")
+                away_lbl = away["full_name"] or away["name"] or away["abbreviation"] or "Visitante"
+                home_lbl = home["full_name"] or home["name"] or home["abbreviation"] or "Local"
+                lbl      = ("🔴 " if df.is_game_live(g) else "⏳ ") + f"{away_lbl} vs {home_lbl}"
+                pk       = g.get("gamePk") or g.get("id")
+                logger.info(f"[LIVESCORE] WBC añadiendo pk={pk} label={lbl}")
+                if pk:
+                    candidates.append((pk, lbl, "wbc"))
+        except Exception as e:
+            logger.error(f"[LIVESCORE] Error fetching WBC: {e}", exc_info=True)
 
     logger.info(f"[LIVESCORE] Candidatos encontrados: {candidates}")
 
