@@ -14,7 +14,7 @@ services:
         sync: false
       - key: MLB_CHANNEL_ID
         sync: false
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEY
         sync: false
       - key: CHECK_INTERVAL_MINUTES
         value: "5"
