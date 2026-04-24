@@ -253,10 +253,11 @@ async def fetch_tweets(username: str, since_id: Optional[str] = None, max_result
 _SYSTEM = """Eres un traductor experto en deportes. Traduce del inglés al español latino.
 REGLAS — nunca las rompas:
 1. NO traduzcas nombres de jugadores ni de equipos.
-2. NO traduzcas estadísticas (pts, reb, ast, ERA, RBI, AVG, HR, SB…).
+2. NO traduzcas estadísticas (pts, reb, ast, ERA, RBI, AVG, HR, SB, SP, DH, 1B, 2B, 3B, SS, CF, RF, LF, C…).
 3. NO traduzcas hashtags ni menciones.
 4. Usa términos en español: canasta, jonrón, ponche, carrera…
-5. Responde SOLO con la traducción. Sin comillas ni explicaciones."""
+5. PRESERVA exactamente el formato del texto original: saltos de línea, listas, espacios.
+6. Responde SOLO con la traducción. Sin comillas ni explicaciones adicionales."""
 
 
 async def translate(text: str, sport: str) -> str:
@@ -498,22 +499,34 @@ async def send_album(cid: str, urls: list, caption: str) -> bool:
 # ══════════════════════════════════════════════════════════════════
 
 def _clean(text: str) -> str:
+    # Quitar URLs de t.co
     text = re.sub(r'https://t\.co/\S+', '', text)
-    return re.sub(r' +', ' ', text).strip()
+    # Reemplazar menciones @cuenta por solo el nombre sin @
+    text = re.sub(r'@(\w+)', r'\1', text)
+    # Limpiar espacios múltiples en cada línea pero PRESERVAR saltos de línea
+    lines = [re.sub(r' +', ' ', line).strip() for line in text.splitlines()]
+    # Quitar líneas vacías consecutivas (máximo una en blanco entre bloques)
+    result = []
+    prev_blank = False
+    for line in lines:
+        if line == '':
+            if not prev_blank:
+                result.append('')
+            prev_blank = True
+        else:
+            result.append(line)
+            prev_blank = False
+    return '\n'.join(result).strip()
 
 
 def _truncate(text: str, max_len: int = 1024) -> str:
     return text if len(text) <= max_len else text[:max_len - 3] + "..."
 
 
-async def build_caption(text: str, sport: str, translate_it: bool, game_end: bool) -> str:
+async def build_caption(text: str, sport: str, translate_it: bool) -> str:
     clean = _clean(text)
     if translate_it:
         clean = await translate(clean, sport)
-    if game_end or is_game_end(clean):
-        emoji = "⚾" if sport == "mlb" else "🏀"
-        clean = f"{emoji} *FINAL DEL ENCUENTRO* {emoji}\n\n{clean}"
-    # Suscripción correcta según el deporte — nunca se mezclan
     sub = MLB_SUBSCRIBE if sport == "mlb" else NBA_SUBSCRIBE
     return _truncate(f"{clean}\n\n*{sub}*")
 
@@ -536,14 +549,13 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict)
     if not should_post(tweet.text, config["photos_only"], media_types):
         return False
 
-    caption = await build_caption(tweet.text, sport, config["translate"], is_game_end(tweet.text))
+    caption = await build_caption(tweet.text, sport, config["translate"])
     photos  = [m for m in tweet.media if m.type == "photo"]
     videos  = [m for m in tweet.media if m.type == "video"]
 
     if not tweet.media:
         return await send_text(channel_id, caption)
     elif videos:
-        # Pasar tweet.url (URL del tweet) para convertir a x.com y descargar con yt-dlp
         ok = await send_video(channel_id, tweet.url, caption, tweet.id)
         if photos: await send_album(channel_id, [p.url for p in photos], "")
         return ok
