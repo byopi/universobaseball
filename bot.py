@@ -67,6 +67,7 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 # ══════════════════════════════════════════════════════════════════
 
 _processed_ids: Set[str] = set()
+_last_ids_memory: Dict[str, str] = {}   # en memoria — sobrevive entre ciclos aunque el disco falle
 _disk_ok = True
 
 
@@ -104,9 +105,19 @@ def load_last_ids() -> Dict[str, str]:
     return {}
 
 def save_last_id(username: str, tid: str):
-    ids = load_last_ids(); ids[username] = tid
-    try: LAST_IDS_FILE.write_text(json.dumps(ids))
+    # Guardar en memoria primero (siempre funciona)
+    _last_ids_memory[username] = tid
+    # Intentar disco también (puede no persistir en Render free)
+    try:
+        ids = load_last_ids(); ids[username] = tid
+        LAST_IDS_FILE.write_text(json.dumps(ids))
     except Exception: pass
+
+def get_last_id(username: str) -> Optional[str]:
+    """Primero memoria, luego disco."""
+    if username in _last_ids_memory:
+        return _last_ids_memory[username]
+    return load_last_ids().get(username)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -137,6 +148,34 @@ def _tid(link: str) -> str:
     return m.group(1) if m else link.split("/")[-1].split("#")[0]
 
 
+def _normalize_media_url(url: str) -> str:
+    """
+    Nitter sirve las fotos y videos con su propio dominio pero la ruta
+    es idéntica a la de Twitter/twimg. Ejemplo:
+      https://nitter.net/pic/tweet_video_thumb%2F... 
+      → https://pbs.twimg.com/tweet_video_thumb/...
+      https://nitter.net/pic/ext_tw_video%2F...
+      → https://video.twimg.com/ext_tw_video/...
+    """
+    from urllib.parse import unquote
+
+    # Ya es una URL directa de twimg — no tocar
+    if "twimg.com" in url or "video.twimg.com" in url:
+        return url
+
+    # Extraer la parte después de /pic/ o /video/
+    for prefix in ["/pic/", "/video/"]:
+        if prefix in url:
+            path = unquote(url.split(prefix, 1)[1])
+            # Videos
+            if "ext_tw_video" in path or "tweet_video" in path and "thumb" not in path:
+                return f"https://video.twimg.com/{path}"
+            # Imágenes
+            return f"https://pbs.twimg.com/{path}"
+
+    return url  # fallback — devolver original
+
+
 def _parse_entry(entry, username: str) -> Optional[Tweet]:
     link = entry.get("link", "")
     soup = BeautifulSoup(entry.get("description", ""), "html.parser")
@@ -145,16 +184,25 @@ def _parse_entry(entry, username: str) -> Optional[Tweet]:
         return None
 
     media = []
+
     for img in soup.find_all("img"):
         src = img.get("src", "")
-        if src and src.startswith("http"):
-            media.append(TweetMedia(type="photo", url=src))
+        if not src or not src.startswith("http"):
+            continue
+        real_url = _normalize_media_url(src)
+        # Si la URL normalizada apunta a video
+        if "video.twimg.com" in real_url or "tweet_video" in real_url:
+            media.append(TweetMedia(type="video", url=real_url))
+        else:
+            media.append(TweetMedia(type="photo", url=real_url))
 
-    # Videos: Nitter los incluye como <video> a veces
     for video in soup.find_all("video"):
-        src = video.get("src", "") or (video.find("source") or {}).get("src", "")
-        if src and src.startswith("http"):
-            media.append(TweetMedia(type="video", url=src))
+        src = video.get("src", "")
+        if not src:
+            source = video.find("source")
+            src = source.get("src", "") if source else ""
+        if src:
+            media.append(TweetMedia(type="video", url=_normalize_media_url(src)))
 
     return Tweet(
         id=_tid(link), text=text, author_username=username,
@@ -173,11 +221,25 @@ async def fetch_tweets(username: str, since_id: Optional[str] = None, max_result
             if resp.status_code != 200: continue
             feed = feedparser.parse(resp.content)
             if not feed.entries: continue
-            tweets = [t for entry in feed.entries[:max_results]
-                      if (t := _parse_entry(entry, username)) and (not since_id or t.id > since_id)]
+
+            tweets = []
+            for entry in feed.entries[:max_results]:
+                t = _parse_entry(entry, username)
+                if not t:
+                    continue
+                # Comparar como enteros — los IDs de Twitter son números de 18-19 dígitos
+                # La comparación de strings falla si tienen distinta longitud
+                if since_id and int(t.id) <= int(since_id):
+                    continue
+                tweets.append(t)
+
             if tweets:
-                print(f"[Nitter] ✅ @{username} via {base} ({len(tweets)} tweets)")
+                print(f"[Nitter] ✅ @{username} via {base} ({len(tweets)} tweets nuevos)")
                 return tweets
+            elif since_id:
+                print(f"[Nitter] ℹ️ @{username} sin tweets nuevos desde {since_id}")
+                return []
+
         except Exception as e:
             print(f"[Nitter] ❌ {base} → {e}")
     print(f"[Nitter] ⚠️ Sin respuesta para @{username}")
@@ -271,27 +333,41 @@ async def video_dims(path: str) -> Tuple[int, int]:
     return 1280, 720
 
 
-async def download_and_encode_video(url: str, tweet_id: str) -> Optional[Tuple[str, int, int]]:
-    """Descarga el video con requests y lo re-encodea con ffmpeg para Telegram."""
-    raw  = str(TEMP_DIR / f"v_{tweet_id}_raw.mp4")
-    out  = str(TEMP_DIR / f"v_{tweet_id}_enc.mp4")
+async def download_and_encode_video(tweet_url: str, tweet_id: str) -> Optional[Tuple[str, int, int]]:
+    """
+    Convierte la URL de nitter a x.com y descarga con yt-dlp.
+    Ejemplo: https://nitter.net/NBA/status/123 → https://x.com/NBA/status/123
+    """
+    # Convertir cualquier dominio de nitter a x.com
+    xcom_url = re.sub(
+        r'https://(nitter\.net|xcancel\.com|nitter\.cz)/',
+        'https://x.com/',
+        tweet_url
+    )
+    # Si ya era x.com o twitter.com no cambia nada
+    xcom_url = xcom_url.replace("https://twitter.com/", "https://x.com/")
 
-    # 1. Descargar con requests (funciona con URLs directas de Nitter/Twitter)
+    out = str(TEMP_DIR / f"v_{tweet_id}_enc.mp4")
+    raw = str(TEMP_DIR / f"v_{tweet_id}_raw.mp4")
+
+    print(f"[Media] Descargando video desde {xcom_url}")
     try:
-        def _dl():
-            r = requests.get(url, headers=HEADERS, timeout=60, stream=True)
-            r.raise_for_status()
-            with open(raw, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    f.write(chunk)
-        await asyncio.get_event_loop().run_in_executor(None, _dl)
+        await _ffmpeg([
+            "yt-dlp",
+            "--no-playlist",
+            "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "--output", raw,
+            "--quiet", "--no-warnings",
+            xcom_url
+        ], timeout=120)
     except Exception as e:
-        print(f"[Media] Error descargando video: {e}"); return None
+        print(f"[Media] yt-dlp falló: {e}"); return None
 
     if not os.path.exists(raw) or os.path.getsize(raw) < 1000:
-        print(f"[Media] Video vacío o corrupto"); _del(raw); return None
+        print(f"[Media] Video no descargado o vacío"); _del(raw); return None
 
-    # 2. Re-encodear → H.264 + AAC + faststart (evita pantalla negra en Telegram)
+    # Re-encodear → H.264 + faststart (evita pantalla negra en Telegram)
     w, h = await video_dims(raw)
     w = w if w % 2 == 0 else w - 1
     h = h if h % 2 == 0 else h - 1
@@ -304,12 +380,12 @@ async def download_and_encode_video(url: str, tweet_id: str) -> Optional[Tuple[s
             "-movflags", "+faststart", "-pix_fmt", "yuv420p", out
         ])
     except Exception as e:
-        print(f"[Media] Error ffmpeg: {e}"); _del(raw); return None
+        print(f"[Media] ffmpeg falló: {e}"); _del(raw); return None
 
     _del(raw)
     if not os.path.exists(out): return None
 
-    # 3. Comprimir si supera 50MB
+    # Comprimir si supera límite de Telegram
     if os.path.getsize(out) > MAX_VIDEO_SIZE_BYTES:
         comp = str(TEMP_DIR / f"v_{tweet_id}_comp.mp4")
         try:
@@ -373,10 +449,10 @@ async def send_photo(cid: str, url: str, caption: str) -> bool:
         _del(local or "")
 
 
-async def send_video(cid: str, url: str, caption: str, tweet_id: str) -> bool:
-    result = await download_and_encode_video(url, tweet_id)
+async def send_video(cid: str, tweet_url: str, caption: str, tweet_id: str) -> bool:
+    result = await download_and_encode_video(tweet_url, tweet_id)
     if not result:
-        print(f"[TG] Video no disponible, enviando como texto")
+        print(f"[TG] Video no descargado, enviando como texto")
         return await send_text(cid, caption)
     path, w, h = result
     try:
@@ -386,7 +462,8 @@ async def send_video(cid: str, url: str, caption: str, tweet_id: str) -> bool:
                                  width=w, height=h, supports_streaming=True)
         return True
     except RetryAfter as e:
-        await asyncio.sleep(e.retry_after); return await send_video(cid, url, caption, tweet_id)
+        await asyncio.sleep(e.retry_after)
+        return await send_video(cid, tweet_url, caption, tweet_id)
     except TelegramError as e:
         print(f"[TG] Error video: {e}"); return False
     finally:
@@ -466,7 +543,8 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict)
     if not tweet.media:
         return await send_text(channel_id, caption)
     elif videos:
-        ok = await send_video(channel_id, videos[0].url, caption, tweet.id)
+        # Pasar tweet.url (URL del tweet) para convertir a x.com y descargar con yt-dlp
+        ok = await send_video(channel_id, tweet.url, caption, tweet.id)
         if photos: await send_album(channel_id, [p.url for p in photos], "")
         return ok
     elif len(photos) == 1:
@@ -477,20 +555,19 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict)
 
 async def run_cycle():
     print("[Bot] 🔄 Iniciando ciclo...")
-    last_ids = load_last_ids()
     tasks: list = []
 
-    # NBA — loop explícito para evitar mezcla de sports
+    # NBA
     for username, config in NBA_ACCOUNTS.items():
-        tweets = await fetch_tweets(username, since_id=last_ids.get(username))
+        tweets = await fetch_tweets(username, since_id=get_last_id(username))
         tweets.reverse()
         for t in tweets:
             if not is_processed(t.id):
                 tasks.append((t, NBA_CHANNEL_ID, "nba", config, username))
 
-    # MLB — loop explícito separado
+    # MLB
     for username, config in MLB_ACCOUNTS.items():
-        tweets = await fetch_tweets(username, since_id=last_ids.get(username))
+        tweets = await fetch_tweets(username, since_id=get_last_id(username))
         tweets.reverse()
         for t in tweets:
             if not is_processed(t.id):
