@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: sports-telegram-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    branch: main
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: NBA_CHANNEL_ID
+        sync: false
+      - key: MLB_CHANNEL_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CHECK_INTERVAL_MINUTES
+        value: "5"
+      - key: PYTHONUNBUFFERED
+        value: "1"

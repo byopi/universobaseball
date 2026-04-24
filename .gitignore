@@ -1,0 +1,10 @@
+.env
+data/
+logs/
+__pycache__/
+*.pyc
+*.mp4
+*.jpg
+*.png
+/tmp/
+.DS_Store
