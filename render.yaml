@@ -14,6 +14,12 @@ services:
         sync: false
       - key: MLB_CHANNEL_ID
         sync: false
+      - key: BARCA_CHANNEL_ID
+        sync: false
+      - key: MADRID_CHANNEL_ID
+        sync: false
+      - key: PREMIER_CHANNEL_ID
+        sync: false
       - key: GROQ_API_KEY
         sync: false
       - key: CHECK_INTERVAL_MINUTES
