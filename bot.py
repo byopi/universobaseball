@@ -143,7 +143,7 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
         entries = (data.get("props", {})
                       .get("pageProps", {})
                       .get("timeline", {})
-                      .get("entries", []))
+                      .get("entries", []))[:10]
         tweets = []
         for entry in entries:
             tweet = entry.get("content", {}).get("tweet", {})
@@ -242,7 +242,7 @@ async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) ->
             if not feed.entries: continue
 
             tweets = []
-            for entry in feed.entries[:15]:
+            for entry in feed.entries[:10]:
                 link = entry.get("link", "")
                 m = re.search(r'/status/(\d+)', link)
                 tid = m.group(1) if m else ""
