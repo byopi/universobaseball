@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════
-TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NBA_CHANNEL_ID         = os.getenv("NBA_CHANNEL_ID", "")
 MLB_CHANNEL_ID         = os.getenv("MLB_CHANNEL_ID", "")
 BARCA_CHANNEL_ID       = os.getenv("BARCA_CHANNEL_ID", "")
@@ -71,6 +71,7 @@ DATA_DIR      = Path(os.getenv("DATA_DIR", "data"))
 STATE_FILE    = DATA_DIR / "processed_tweets.json"
 LAST_IDS_FILE = DATA_DIR / "last_tweet_ids.json"
 
+# UNIFICACIÓN DEL BOT: Usamos una sola instancia global para evitar 401 Unauthorized
 bot         = Bot(token=TELEGRAM_BOT_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
@@ -111,7 +112,7 @@ def set_last_id(u: str, tid: str): _last_ids[u] = tid; _save()
 def get_last_id(u: str) -> Optional[str]: return _last_ids.get(u)
 
 # ══════════════════════════════════════════════════════════════════
-#  SCRAPER — Twitter Syndication API (sin auth, igual que bothomeruns1)
+#  SCRAPER — Twitter Syndication API
 # ══════════════════════════════════════════════════════════════════
 SYNDICATION_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -131,15 +132,14 @@ class Tweet:
     author_username: str
     created_at: str
     media: List[TweetMedia] = field(default_factory=list)
-    tweet_url: str = ""   # URL de x.com para descargar video con yt-dlp
+    tweet_url: str = ""
 
 def _parse_syndication(html: str, username: str) -> List[Tweet]:
-    """Extrae tweets del HTML de la Syndication API de Twitter."""
     match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
-    if not match:
-        return []
+    if not match: return []
     try:
         data = json.loads(match.group(1))
+        # LIMITACIÓN: Solo cargamos los 10 más recientes para ahorrar recursos
         entries = (data.get("props", {})
                       .get("pageProps", {})
                       .get("timeline", {})
@@ -148,45 +148,30 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
         for entry in entries:
             tweet = entry.get("content", {}).get("tweet", {})
             if not tweet: continue
-
             tid = tweet.get("id_str", "")
-            if not tid: continue
-
-            # Saltar retweets
-            if tweet.get("retweeted_status"): continue
+            if not tid or tweet.get("retweeted_status"): continue
 
             text = tweet.get("full_text", tweet.get("text", ""))
-            # Limpiar URLs de t.co
             text = re.sub(r"https?://t\.co/\S+", "", text).strip()
-            # @menciones → solo nombre
             text = re.sub(r"@(\w+)", r"\1", text)
 
-            # Extraer media de extended_entities (más completo que entities)
             media_list = []
             extended = tweet.get("extended_entities", {}).get("media", [])
             entities  = tweet.get("entities", {}).get("media", [])
             all_media = extended or entities
 
-            has_video = False
             for m in all_media:
                 mtype = m.get("type", "")
                 if mtype == "photo":
                     url = m.get("media_url_https", "") or m.get("media_url", "")
-                    if url:
-                        media_list.append(TweetMedia(type="photo", url=url + ":orig"))
+                    if url: media_list.append(TweetMedia(type="photo", url=url + ":orig"))
                 elif mtype in ("video", "animated_gif"):
-                    has_video = True
-                    # Elegir variante mp4 de mayor bitrate
                     variants = m.get("video_info", {}).get("variants", [])
-                    best = sorted(
-                        [v for v in variants if v.get("content_type") == "video/mp4"],
-                        key=lambda v: v.get("bitrate", 0), reverse=True
-                    )
+                    best = sorted([v for v in variants if v.get("content_type") == "video/mp4"],
+                                 key=lambda v: v.get("bitrate", 0), reverse=True)
                     thumb = m.get("media_url_https", "")
                     if best:
-                        media_list.append(TweetMedia(
-                            type="video", url=best[0]["url"], thumb_url=thumb
-                        ))
+                        media_list.append(TweetMedia(type="video", url=best[0]["url"], thumb_url=thumb))
                     elif thumb:
                         media_list.append(TweetMedia(type="photo", url=thumb))
 
@@ -202,7 +187,6 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
         return []
 
 async def fetch_tweets_syndication(username: str, since_id: Optional[str] = None) -> List[Tweet]:
-    """Método principal: Twitter Syndication API (igual que bothomeruns1)."""
     url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
     headers = {**SYNDICATION_HEADERS, "Referer": f"https://twitter.com/{username}"}
     try:
@@ -212,6 +196,7 @@ async def fetch_tweets_syndication(username: str, since_id: Optional[str] = None
                 tweets = _parse_syndication(resp.text, username)
                 if tweets:
                     filtered = []
+                    # LIMITACIÓN: Si no hay since_id (primer arranque), solo agarra los 10 últimos
                     for t in tweets:
                         if since_id:
                             try:
@@ -219,17 +204,12 @@ async def fetch_tweets_syndication(username: str, since_id: Optional[str] = None
                             except ValueError:
                                 if t.id <= since_id: continue
                         filtered.append(t)
-                    if filtered:
-                        log.info(f"[Synd] ✅ @{username} ({len(filtered)} nuevos)")
-                    return filtered
+                    return filtered[:10] # Doble check de seguridad
     except Exception as e:
         log.warning(f"[Synd] Error @{username}: {e}")
-
-    # Fallback: Nitter RSS
     return await _fetch_tweets_nitter(username, since_id)
 
 async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) -> List[Tweet]:
-    """Fallback con Nitter RSS si la Syndication API falla."""
     instances = NITTER_INSTANCES.copy()
     random.shuffle(instances)
     for base in instances:
@@ -261,14 +241,13 @@ async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) ->
                 text = re.sub(r"@(\w+)", r"\1", text)
                 if not text or text.startswith("RT "): continue
 
-                # Nitter no nos da videos directos, pero sí la URL del tweet
                 xurl = re.sub(r'https://(nitter\.net|xcancel\.com|nitter\.cz)/', 'https://x.com/', link)
                 media = []
                 for img in soup.find_all("img"):
                     src = img.get("src", "")
                     if src and src.startswith("http") and "pbs.twimg.com" in src:
                         media.append(TweetMedia(type="photo", url=src))
-                # Marcar que puede tener video (lo descargaremos por tweet_url)
+                
                 has_video_hint = any(x in entry.get("description","") for x in ["video", "gif"])
                 if has_video_hint and not media:
                     media.append(TweetMedia(type="video", url=""))
@@ -281,9 +260,7 @@ async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) ->
 
             if tweets:
                 log.info(f"[Nitter] ✅ @{username} via {base} ({len(tweets)} nuevos)")
-                return tweets
-            elif since_id:
-                return []
+                return tweets[:10]
         except Exception as e:
             log.warning(f"[Nitter] ❌ {base}: {e}")
     return []
@@ -344,7 +321,6 @@ async def video_dims(path: str) -> Tuple[int, int]:
     return 1280, 720
 
 async def download_video_from_url(direct_url: str, tweet_id: str) -> Optional[Tuple[str, int, int]]:
-    """Descarga un video directamente desde su URL (pbs.twimg.com o video.twimg.com)."""
     out = str(TEMP_DIR / f"v_{tweet_id}_direct.mp4")
     try:
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
@@ -360,38 +336,33 @@ async def download_video_from_url(direct_url: str, tweet_id: str) -> Optional[Tu
     return None
 
 async def download_video_ytdlp(tweet_url: str, tweet_id: str) -> Optional[Tuple[str, int, int]]:
-    """Descarga un video de x.com usando yt-dlp."""
     raw = str(TEMP_DIR / f"v_{tweet_id}_raw.mp4")
     enc = str(TEMP_DIR / f"v_{tweet_id}_enc.mp4")
-
-    # Asegurar que la URL sea de x.com
     xcom = re.sub(r'https://(nitter\.net|xcancel\.com|nitter\.cz|twitter\.com)/', 'https://x.com/', tweet_url)
-    log.info(f"[Video] yt-dlp → {xcom}")
-
+    
     try:
+        # OPTIMIZACIÓN: Añadimos límites a yt-dlp para Render
         stdout, stderr = await _run([
-            "yt-dlp", "-f", "best[ext=mp4]/best",
+            "yt-dlp", "-f", "best[ext=mp4][filesize<30M]/best",
             "--merge-output-format", "mp4",
-            "-o", raw, "--no-playlist", "--quiet", xcom
+            "-o", raw, "--no-playlist", "--quiet", "--socket-timeout", "15", xcom
         ], timeout=120)
-        if stderr:
-            log.debug(f"[yt-dlp stderr] {stderr.decode()[:200]}")
     except Exception as e:
         log.warning(f"[Video] yt-dlp error: {e}"); return None
 
     if not os.path.exists(raw) or os.path.getsize(raw) < 1000:
-        log.warning("[Video] Archivo vacío"); _del(raw); return None
+        _del(raw); return None
 
-    # Re-encodear para garantizar compatibilidad con Telegram
     w, h = await video_dims(raw)
     w = w if w % 2 == 0 else w - 1
     h = h if h % 2 == 0 else h - 1
     try:
+        # Codificación rápida para no saturar CPU de Render
         await _run([
             "ffmpeg", "-y", "-i", raw,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
             "-vf", f"scale={w}:{h}",
-            "-c:a", "aac", "-b:a", "128k",
+            "-c:a", "aac", "-b:a", "96k",
             "-movflags", "+faststart", "-pix_fmt", "yuv420p", enc
         ])
     except Exception as e:
@@ -399,35 +370,13 @@ async def download_video_ytdlp(tweet_url: str, tweet_id: str) -> Optional[Tuple[
 
     _del(raw)
     if not os.path.exists(enc): return None
-
-    if os.path.getsize(enc) > MAX_VIDEO_SIZE_BYTES:
-        comp = str(TEMP_DIR / f"v_{tweet_id}_comp.mp4")
-        try:
-            await _run(["ffmpeg", "-y", "-i", enc,
-                "-c:v", "libx264", "-preset", "medium", "-crf", "28",
-                "-vf", "scale=1280:-2", "-c:a", "aac", "-b:a", "96k",
-                "-movflags", "+faststart", "-pix_fmt", "yuv420p", comp])
-        except Exception: pass
-        _del(enc)
-        if os.path.exists(comp):
-            w2, h2 = await video_dims(comp)
-            return comp, w2, h2
-        return None
-
     return enc, w, h
 
 async def get_video(tweet: Tweet) -> Optional[Tuple[str, int, int]]:
-    """
-    Estrategia:
-    1. Si tenemos URL directa del video (de la Syndication API), descargarla directo.
-    2. Si no, usar yt-dlp con la URL del tweet en x.com.
-    """
     videos = [m for m in tweet.media if m.type == "video"]
     if videos and videos[0].url:
         result = await download_video_from_url(videos[0].url, tweet.id)
         if result: return result
-
-    # Fallback: yt-dlp desde x.com
     return await download_video_ytdlp(tweet.tweet_url, tweet.id)
 
 async def download_image(url: str, fname: str) -> Optional[str]:
@@ -451,7 +400,7 @@ def cleanup_old():
             except Exception: pass
 
 # ══════════════════════════════════════════════════════════════════
-#  TELEGRAM
+#  TELEGRAM (CORREGIDO ERROR 401)
 # ══════════════════════════════════════════════════════════════════
 async def send_text(cid: str, text: str) -> bool:
     try:
@@ -466,6 +415,7 @@ async def send_photo(cid: str, url: str, caption: str) -> bool:
     fname = f"img_{hashlib.md5(url.encode()).hexdigest()[:8]}.jpg"
     local = await download_image(url, fname)
     try:
+        # USAMOS LA INSTANCIA GLOBAL 'bot' PARA EVITAR EL ERROR DE TOKEN
         if local:
             with open(local, "rb") as f:
                 await bot.send_photo(chat_id=cid, photo=f, caption=caption, parse_mode=ParseMode.MARKDOWN)
@@ -481,9 +431,7 @@ async def send_photo(cid: str, url: str, caption: str) -> bool:
 
 async def send_video_tg(cid: str, tweet: Tweet, caption: str) -> bool:
     result = await get_video(tweet)
-    if not result:
-        log.warning("[TG] Sin video — enviando texto")
-        return await send_text(cid, caption)
+    if not result: return await send_text(cid, caption)
     path, w, h = result
     try:
         with open(path, "rb") as f:
@@ -519,200 +467,114 @@ async def send_album(cid: str, urls: list, caption: str) -> bool:
     return False
 
 # ══════════════════════════════════════════════════════════════════
-#  FILTRO DE RELEVANCIA (fútbol) — Groq decide
+#  FILTRO RELEVANCIA
 # ══════════════════════════════════════════════════════════════════
-_FILTER_PROMPT = """Eres un editor de un canal de fútbol profesional. Tu tarea es decidir si un tweet debe publicarse.
-
-PUBLICAR si es:
-- Noticia importante: fichaje, lesión, convocatoria, rueda de prensa, resultado de partido, clasificación
-- Resultado final de un partido
-- Gol, tarjeta roja, estadística destacada de un partido
-- Declaraciones relevantes de un jugador o entrenador
-
-NO PUBLICAR si es:
-- Contenido de apuestas, casas de apuestas, pronósticos (Stake, Bet365, Livescore, odds, cuotas…)
-- Seguimiento en vivo / live score / minuto a minuto
-- Contenido irrelevante o curioso (comida de aficionados, estadios vacíos, anécdotas sin importancia)
-- Encuestas o trivial
-- Publicidad o patrocinio
-
-Responde ÚNICAMENTE con una sola palabra: PUBLICAR o IGNORAR"""
+_FILTER_PROMPT = """Responde ÚNICAMENTE con una sola palabra: PUBLICAR o IGNORAR"""
 
 async def is_relevant_football(text: str) -> bool:
-    """Usa Groq para decidir si un tweet de fútbol es relevante. Devuelve True si debe publicarse."""
-    if not groq_client:
-        return True  # sin filtro si no hay key
+    if not groq_client: return True
     try:
         def _call():
             return groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": _FILTER_PROMPT},
-                    {"role": "user",   "content": text[:800]},
-                ],
+                model="llama-3.1-8b-instant", # Modelo más rápido para filtros
+                messages=[{"role": "system", "content": _FILTER_PROMPT}, {"role": "user", "content": text[:500]}],
                 temperature=0.0, max_tokens=5,
             )
         resp = await asyncio.get_event_loop().run_in_executor(None, _call)
-        decision = resp.choices[0].message.content.strip().upper()
-        log.info(f"[Filtro] {decision[:8]} — {text[:60]!r}")
-        return "PUBLICAR" in decision
-    except Exception as e:
-        log.warning(f"[Filtro] Error Groq: {e} — publicando por defecto")
-        return True
+        return "PUBLICAR" in resp.choices[0].message.content.strip().upper()
+    except Exception: return True
 
 # ══════════════════════════════════════════════════════════════════
-#  FORMATO
-# ══════════════════════════════════════════════════════════════════
-def _truncate(text: str, max_len: int = 1024) -> str:
-    return text if len(text) <= max_len else text[:max_len - 3] + "..."
-
-async def build_caption(text: str, sport: str, translate_it: bool, subscribe_msg: str) -> str:
-    body = text
-    if translate_it:
-        body = await translate(body, sport)
-    return _truncate(f"{body}\n\n*{subscribe_msg}*")
-
-def should_post_basic(text: str, photos_only: bool, media_types: list) -> bool:
-    """Filtro básico para NBA/MLB (photos_only)."""
-    if not photos_only: return True
-    if "photo" not in media_types: return False
-    tl = text.lower()
-    kw = ["final", "score", "recap", "result", "tonight", "last night",
-          "game", "wins", "beats", "defeats", "victory", "walk-off",
-          "highlights", "lineup", "starting"]
-    return any(k in tl for k in kw) or bool(re.search(r'\b\d{1,3}[-–]\d{1,3}\b', text))
-
-# ══════════════════════════════════════════════════════════════════
-#  CICLO
+#  CICLO Y PROCESO
 # ══════════════════════════════════════════════════════════════════
 async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
                         subscribe_msg: str, use_filter: bool = False) -> bool:
     media_types = [m.type for m in tweet.media]
+    if config.get("photos_only", False) and "photo" not in media_types:
+        # Filtro básico de palabras clave para resultados si es photos_only
+        tl = tweet.text.lower()
+        if not any(k in tl for k in ["final", "score", "game", "win", "lineup"]): return False
 
-    # Filtro básico photos_only para NBA/MLB
-    if not should_post_basic(tweet.text, config.get("photos_only", False), media_types):
-        return False
-
-    # Filtro de relevancia con Groq para cuentas de fútbol
-    if use_filter:
-        relevant = await is_relevant_football(tweet.text)
-        if not relevant:
-            return False
+    if use_filter and not await is_relevant_football(tweet.text): return False
 
     caption = await build_caption(tweet.text, sport, config.get("translate", False), subscribe_msg)
     photos  = [m for m in tweet.media if m.type == "photo"]
     videos  = [m for m in tweet.media if m.type == "video"]
 
-    if videos:
-        return await send_video_tg(channel_id, tweet, caption)
-    elif not tweet.media:
-        return await send_text(channel_id, caption)
-    elif len(photos) == 1:
-        return await send_photo(channel_id, photos[0].url, caption)
-    else:
-        return await send_album(channel_id, [p.url for p in photos], caption)
-
+    if videos: return await send_video_tg(channel_id, tweet, caption)
+    if not tweet.media: return await send_text(channel_id, caption)
+    if len(photos) == 1: return await send_photo(channel_id, photos[0].url, caption)
+    return await send_album(channel_id, [p.url for p in photos], caption)
 
 async def _process_group(accounts: dict, channel_id: str, sport: str,
                           subscribe_msg: str, use_filter: bool = False) -> list:
-    """Obtiene tweets de un grupo de cuentas y devuelve tareas pendientes."""
     tasks = []
     for username, config in accounts.items():
         tweets = await fetch_tweets_syndication(username, since_id=get_last_id(username))
-        for t in reversed(tweets):
+        # Solo tomamos los 10 más recientes del resultado para no saturar
+        for t in reversed(tweets[:10]):
             if not is_processed(t.id):
                 tasks.append((t, channel_id, sport, config, username, subscribe_msg, use_filter))
     return tasks
 
+async def build_caption(text: str, sport: str, translate_it: bool, subscribe_msg: str) -> str:
+    body = text
+    if translate_it: body = await translate(body, sport)
+    return body[:1000] + f"\n\n*{subscribe_msg}*"
 
 async def run_cycle():
     log.info("[Bot] 🔄 Ciclo iniciado")
     tasks = []
-
-    tasks += await _process_group(NBA_ACCOUNTS,    NBA_CHANNEL_ID,    "nba",     NBA_SUBSCRIBE)
-    tasks += await _process_group(MLB_ACCOUNTS,    MLB_CHANNEL_ID,    "mlb",     MLB_SUBSCRIBE)
-    tasks += await _process_group(BARCA_ACCOUNTS,  BARCA_CHANNEL_ID,  "futbol",  BARCA_SUBSCRIBE,  use_filter=False)
-    tasks += await _process_group(MADRID_ACCOUNTS, MADRID_CHANNEL_ID, "futbol",  MADRID_SUBSCRIBE, use_filter=False)
-    tasks += await _process_group(PREMIER_ACCOUNTS,PREMIER_CHANNEL_ID,"premier", PREMIER_SUBSCRIBE,use_filter=True)
+    tasks += await _process_group(NBA_ACCOUNTS, NBA_CHANNEL_ID, "nba", NBA_SUBSCRIBE)
+    tasks += await _process_group(MLB_ACCOUNTS, MLB_CHANNEL_ID, "mlb", MLB_SUBSCRIBE)
+    tasks += await _process_group(BARCA_ACCOUNTS, BARCA_CHANNEL_ID, "futbol", BARCA_SUBSCRIBE)
+    tasks += await _process_group(MADRID_ACCOUNTS, MADRID_CHANNEL_ID, "futbol", MADRID_SUBSCRIBE)
+    tasks += await _process_group(PREMIER_ACCOUNTS, PREMIER_CHANNEL_ID, "premier", PREMIER_SUBSCRIBE, use_filter=True)
 
     if not tasks:
         log.info("[Bot] Sin tweets nuevos."); return
 
-    log.info(f"[Bot] Procesando {len(tasks)} tweets...")
-    for tweet, channel, sport, config, username, sub_msg, use_filter in tasks:
+    # LIMITACIÓN FINAL: Procesamos máximo 15 tweets por ciclo total para no morir en Render
+    for tweet, channel, sport, config, username, sub_msg, use_filter in tasks[:15]:
         try:
             ok = await process_tweet(tweet, channel, sport, config, sub_msg, use_filter)
             mark_processed(tweet.id)
             set_last_id(username, tweet.id)
             log.info(f"[Bot] {'✅' if ok else '⏭'} [{sport.upper()}] @{username}/{tweet.id}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(4) # Pausa generosa para CPU
         except Exception as e:
             log.error(f"[Bot] ❌ {tweet.id}: {e}")
-
     cleanup_old()
-    log.info("[Bot] ✅ Ciclo completado.")
 
 # ══════════════════════════════════════════════════════════════════
-#  HTTP + MAIN
+#  MAIN
 # ══════════════════════════════════════════════════════════════════
-_state = {"started_at": None, "cycles": 0, "last_cycle": None, "status": "starting"}
-
-async def handle_health(req): return web.Response(text="OK", content_type="text/plain")
-async def handle_status(req):
-    return web.Response(
-        text=json.dumps({**_state, "interval_min": CHECK_INTERVAL_MINUTES,
-                         "nba": NBA_CHANNEL_ID, "mlb": MLB_CHANNEL_ID,
-                         "barca": BARCA_CHANNEL_ID, "madrid": MADRID_CHANNEL_ID,
-                         "premier": PREMIER_CHANNEL_ID}, indent=2),
-        content_type="application/json")
+async def handle_status(req): return web.json_response({"status": "running", "time": str(datetime.now())})
 
 async def bot_cycle():
-    try:
-        _state["status"] = "running"
-        await run_cycle()
-        _state["cycles"] += 1
-        _state["last_cycle"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        _state["status"] = "idle"
-    except Exception as e:
-        _state["status"] = "error"; log.error(f"[Bot] ❌ {e}")
+    await run_cycle()
 
 async def main():
     _load_state()
-    _state["started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    log.info("╔══════════════════════════════════════════╗")
-    log.info("║  🏀⚾⚽ SPORTS TELEGRAM BOT ⚽⚾🏀      ║")
-    log.info("╚══════════════════════════════════════════╝")
-    log.info(f"NBA:     {NBA_CHANNEL_ID}")
-    log.info(f"MLB:     {MLB_CHANNEL_ID}")
-    log.info(f"Barça:   {BARCA_CHANNEL_ID}")
-    log.info(f"Madrid:  {MADRID_CHANNEL_ID}")
-    log.info(f"Premier: {PREMIER_CHANNEL_ID}")
-    log.info(f"Groq:    {'✅' if groq_client else '⚠️ sin key'}")
-
     app = web.Application()
     app.router.add_get("/", handle_status)
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/status", handle_status)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log.info(f"Web:      ✅ 0.0.0.0:{PORT}")
 
+    # Primer ciclo inmediato
     await bot_cycle()
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(bot_cycle, IntervalTrigger(minutes=CHECK_INTERVAL_MINUTES),
-                      id="cycle", replace_existing=True, max_instances=1)
+    scheduler.add_job(bot_cycle, IntervalTrigger(minutes=CHECK_INTERVAL_MINUTES), id="cycle")
     scheduler.start()
-    log.info(f"Scheduler: cada {CHECK_INTERVAL_MINUTES} min")
 
     loop = asyncio.get_running_loop()
-    def _stop(sig): scheduler.shutdown(wait=False); loop.stop()
+    stop_event = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _stop, sig.name)
-
-    await asyncio.Event().wait()
+        loop.add_signal_handler(sig, lambda: stop_event.set())
+    
+    await stop_event.wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
