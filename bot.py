@@ -36,8 +36,8 @@ PORT                   = int(os.getenv("PORT", "8080"))
 
 NBA_SUBSCRIBE     = "📲 Suscríbete en t.me/NBA_Latinoamerica"
 MLB_SUBSCRIBE     = "📲 Suscríbete en t.me/UniversoBaseball"
-BARCA_SUBSCRIBE   = "📲 Suscríbete en t.me/iFCBNewsES"
-MADRID_SUBSCRIBE  = "📲 Suscríbete en t.me/iRMNewsES"
+BARCA_SUBSCRIBE   = "📲 Suscríbete en t.me/BarcaZoneES"
+MADRID_SUBSCRIBE  = "📲 Suscríbete en t.me/MadridZoneES"
 PREMIER_SUBSCRIBE = "📲 Suscríbete en t.me/PremierLeague_ES"
 
 # ── Cuentas por deporte ───────────────────────────────────────────
@@ -86,7 +86,9 @@ def _load_state():
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if STATE_FILE.exists():
-            _processed_ids.update(json.loads(STATE_FILE.read_text()).get("ids", []))
+            data = json.loads(STATE_FILE.read_text())
+            _processed_ids.update(data.get("ids", []))
+            _sent_messages.update({k: v for k, v in data.get("sent_msgs", {}).items()})
         if LAST_IDS_FILE.exists():
             _last_ids.update(json.loads(LAST_IDS_FILE.read_text()))
     except Exception as e:
@@ -96,7 +98,10 @@ def _save():
     if not _disk_ok: return
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps({"ids": list(_processed_ids)}))
+        STATE_FILE.write_text(json.dumps({
+            "ids": list(_processed_ids),
+            "sent_msgs": _sent_messages,
+        }))
         LAST_IDS_FILE.write_text(json.dumps(_last_ids))
     except Exception: pass
 
@@ -131,7 +136,8 @@ class Tweet:
     author_username: str
     created_at: str
     media: List[TweetMedia] = field(default_factory=list)
-    tweet_url: str = ""   # URL de x.com para descargar video con yt-dlp
+    tweet_url: str = ""
+    quoted_tweet_id: str = ""   # ID del tweet citado (si lo hay)
 
 def _parse_syndication(html: str, username: str) -> List[Tweet]:
     """Extrae tweets del HTML de la Syndication API de Twitter."""
@@ -139,11 +145,7 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
     if not match:
         return []
 
-    # ID mínimo aceptable: tweets de los últimos 30 días
-    # Los Twitter IDs son Snowflake — crecen con el tiempo
-    # ID aproximado de hace 30 días: calculado desde la época de Twitter
     import time as _time
-    # Snowflake: (timestamp_ms - 1288834974657) << 22
     cutoff_ms = int((_time.time() - 30 * 86400) * 1000)
     min_id = (cutoff_ms - 1288834974657) << 22
     if min_id < 0: min_id = 0
@@ -161,21 +163,25 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
 
             tid = tweet.get("id_str", "")
             if not tid: continue
-
-            # Saltar retweets
             if tweet.get("retweeted_status"): continue
 
-            # Saltar tweets fijados (pinned) que sean muy antiguos
             try:
                 if int(tid) < min_id:
-                    log.info(f"[Synd] Saltando tweet antiguo/pinned {tid} de @{username}")
+                    log.info(f"[Synd] Saltando tweet antiguo {tid} de @{username}")
                     continue
-            except ValueError:
-                pass
+            except ValueError: pass
 
             text = tweet.get("full_text", tweet.get("text", ""))
             text = re.sub(r"https?://t\.co/\S+", "", text).strip()
             text = re.sub(r"@(\w+)", r"\1", text)
+
+            # Detectar si es un tweet citado
+            quoted_tweet_id = ""
+            quoted = tweet.get("quoted_status")
+            if quoted:
+                quoted_tweet_id = quoted.get("id_str", "")
+                # El texto del tweet original no incluye el cuerpo del citado — solo el comentario
+                # El texto del tweet citado lo ignoramos, solo lo usamos para saber a qué responder
 
             media_list = []
             extended = tweet.get("extended_entities", {}).get("media", [])
@@ -187,7 +193,7 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
                 if mtype == "photo":
                     url = m.get("media_url_https", "") or m.get("media_url", "")
                     if url:
-                        media_list.append(TweetMedia(type="photo", url=url + ":orig"))
+                        media_list.append(TweetMedia(type="photo", url=url))  # sin :orig para evitar 403
                 elif mtype in ("video", "animated_gif"):
                     variants = m.get("video_info", {}).get("variants", [])
                     best = sorted(
@@ -205,6 +211,7 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
                 created_at=tweet.get("created_at", ""),
                 media=media_list,
                 tweet_url=f"https://x.com/{username}/status/{tid}",
+                quoted_tweet_id=quoted_tweet_id,
             ))
         return tweets
     except Exception as e:
@@ -463,56 +470,68 @@ def cleanup_old():
 # ══════════════════════════════════════════════════════════════════
 #  TELEGRAM
 # ══════════════════════════════════════════════════════════════════
-async def send_text(cid: str, text: str) -> bool:
+async def send_text(cid: str, text: str, reply_to: int = None) -> bool:
     try:
-        await bot.send_message(chat_id=cid, text=text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await bot.send_message(chat_id=cid, text=text, parse_mode=ParseMode.MARKDOWN,
+                               disable_web_page_preview=True,
+                               reply_to_message_id=reply_to)
         return True
     except RetryAfter as e:
-        await asyncio.sleep(e.retry_after); return await send_text(cid, text)
+        await asyncio.sleep(e.retry_after); return await send_text(cid, text, reply_to)
     except TelegramError as e:
         log.error(f"[TG] texto: {e}"); return False
 
-async def send_photo(cid: str, url: str, caption: str) -> bool:
+async def send_photo(cid: str, url: str, caption: str, reply_to: int = None) -> bool:
     fname = f"img_{hashlib.md5(url.encode()).hexdigest()[:8]}.jpg"
     local = await download_image(url, fname)
+    # Fallback: si falla con :orig intentar sin él
+    if not local and ":orig" in url:
+        local = await download_image(url.replace(":orig", ""), fname)
     try:
         if local:
             with open(local, "rb") as f:
-                await bot.send_photo(chat_id=cid, photo=f, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                await bot.send_photo(chat_id=cid, photo=f, caption=caption,
+                                     parse_mode=ParseMode.MARKDOWN,
+                                     reply_to_message_id=reply_to)
         else:
-            await bot.send_photo(chat_id=cid, photo=url, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            await bot.send_photo(chat_id=cid, photo=url, caption=caption,
+                                 parse_mode=ParseMode.MARKDOWN,
+                                 reply_to_message_id=reply_to)
         return True
     except RetryAfter as e:
-        await asyncio.sleep(e.retry_after); return await send_photo(cid, url, caption)
+        await asyncio.sleep(e.retry_after); return await send_photo(cid, url, caption, reply_to)
     except TelegramError as e:
         log.error(f"[TG] foto: {e}"); return False
     finally:
         _del(local or "")
 
-async def send_video_tg(cid: str, tweet: Tweet, caption: str) -> bool:
+async def send_video_tg(cid: str, tweet: Tweet, caption: str, reply_to: int = None) -> bool:
     result = await get_video(tweet)
     if not result:
         log.warning("[TG] Sin video — enviando texto")
-        return await send_text(cid, caption)
+        return await send_text(cid, caption, reply_to)
     path, w, h = result
     try:
         with open(path, "rb") as f:
             await bot.send_video(chat_id=cid, video=f, caption=caption,
-                                 parse_mode=ParseMode.MARKDOWN, width=w, height=h, supports_streaming=True)
+                                 parse_mode=ParseMode.MARKDOWN, width=w, height=h,
+                                 supports_streaming=True, reply_to_message_id=reply_to)
         return True
     except RetryAfter as e:
-        await asyncio.sleep(e.retry_after); return await send_video_tg(cid, tweet, caption)
+        await asyncio.sleep(e.retry_after); return await send_video_tg(cid, tweet, caption, reply_to)
     except TelegramError as e:
         log.error(f"[TG] video: {e}"); return False
     finally:
         _del(path)
 
-async def send_album(cid: str, urls: list, caption: str) -> bool:
+async def send_album(cid: str, urls: list, caption: str, reply_to: int = None) -> bool:
     locals_, media = [], []
     try:
         for i, url in enumerate(urls[:10]):
             fname = f"img_{hashlib.md5(url.encode()).hexdigest()[:8]}.jpg"
             p = await download_image(url, fname)
+            if not p and ":orig" in url:
+                p = await download_image(url.replace(":orig", ""), fname)
             if p:
                 locals_.append(p)
                 media.append(InputMediaPhoto(
@@ -521,7 +540,9 @@ async def send_album(cid: str, urls: list, caption: str) -> bool:
                     parse_mode=ParseMode.MARKDOWN if i == 0 else None,
                 ))
         if media:
-            await bot.send_media_group(chat_id=cid, media=media); return True
+            await bot.send_media_group(chat_id=cid, media=media,
+                                       reply_to_message_id=reply_to)
+            return True
     except TelegramError as e:
         log.error(f"[TG] álbum: {e}")
     finally:
@@ -570,6 +591,21 @@ async def is_relevant_football(text: str) -> bool:
         log.warning(f"[Filtro] Error Groq: {e} — publicando por defecto")
         return True
 
+# Dict en memoria: tweet_id → telegram message_id (para responder a tweets citados)
+# Se guarda en disco junto con el estado
+_sent_messages: Dict[str, int] = {}
+
+def get_sent_msg_id(tweet_id: str) -> Optional[int]:
+    return _sent_messages.get(tweet_id)
+
+def save_sent_msg_id(tweet_id: str, msg_id: int):
+    _sent_messages[tweet_id] = msg_id
+    # Limpiar si crece mucho (guardar solo los últimos 2000)
+    if len(_sent_messages) > 2000:
+        oldest_keys = list(_sent_messages.keys())[:-1500]
+        for k in oldest_keys: del _sent_messages[k]
+    _save()
+
 # ══════════════════════════════════════════════════════════════════
 #  FORMATO
 # ══════════════════════════════════════════════════════════════════
@@ -599,28 +635,102 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
                         subscribe_msg: str, use_filter: bool = False) -> bool:
     media_types = [m.type for m in tweet.media]
 
-    # Filtro básico photos_only para NBA/MLB
     if not should_post_basic(tweet.text, config.get("photos_only", False), media_types):
         return False
 
-    # Filtro de relevancia con Groq para cuentas de fútbol
     if use_filter:
-        relevant = await is_relevant_football(tweet.text)
-        if not relevant:
+        if not await is_relevant_football(tweet.text):
             return False
 
     caption = await build_caption(tweet.text, sport, config.get("translate", False), subscribe_msg)
     photos  = [m for m in tweet.media if m.type == "photo"]
     videos  = [m for m in tweet.media if m.type == "video"]
 
-    if videos:
-        return await send_video_tg(channel_id, tweet, caption)
-    elif not tweet.media:
-        return await send_text(channel_id, caption)
-    elif len(photos) == 1:
-        return await send_photo(channel_id, photos[0].url, caption)
-    else:
-        return await send_album(channel_id, [p.url for p in photos], caption)
+    # Si es un tweet citado, responder al mensaje original que ya enviamos
+    reply_to = None
+    if tweet.quoted_tweet_id:
+        reply_to = get_sent_msg_id(tweet.quoted_tweet_id)
+        if reply_to:
+            log.info(f"[Bot] Tweet citado → respondiendo a msg_id {reply_to}")
+
+    # Enviar y capturar el message_id de Telegram para futuras respuestas
+    msg_id = None
+    try:
+        if videos:
+            result = await get_video(tweet)
+            if not result:
+                msg = await bot.send_message(chat_id=channel_id, text=caption,
+                                             parse_mode=ParseMode.MARKDOWN,
+                                             disable_web_page_preview=True,
+                                             reply_to_message_id=reply_to)
+                msg_id = msg.message_id
+            else:
+                path, w, h = result
+                try:
+                    with open(path, "rb") as f:
+                        msg = await bot.send_video(chat_id=channel_id, video=f, caption=caption,
+                                                   parse_mode=ParseMode.MARKDOWN, width=w, height=h,
+                                                   supports_streaming=True, reply_to_message_id=reply_to)
+                    msg_id = msg.message_id
+                finally:
+                    _del(path)
+
+        elif not tweet.media:
+            msg = await bot.send_message(chat_id=channel_id, text=caption,
+                                         parse_mode=ParseMode.MARKDOWN,
+                                         disable_web_page_preview=True,
+                                         reply_to_message_id=reply_to)
+            msg_id = msg.message_id
+
+        elif len(photos) == 1:
+            fname = f"img_{hashlib.md5(photos[0].url.encode()).hexdigest()[:8]}.jpg"
+            local = await download_image(photos[0].url, fname)
+            try:
+                src = open(local, "rb") if local else photos[0].url
+                if local:
+                    with open(local, "rb") as f:
+                        msg = await bot.send_photo(chat_id=channel_id, photo=f, caption=caption,
+                                                   parse_mode=ParseMode.MARKDOWN,
+                                                   reply_to_message_id=reply_to)
+                else:
+                    msg = await bot.send_photo(chat_id=channel_id, photo=photos[0].url,
+                                               caption=caption, parse_mode=ParseMode.MARKDOWN,
+                                               reply_to_message_id=reply_to)
+                msg_id = msg.message_id
+            finally:
+                _del(local or "")
+
+        else:
+            # Álbum — el message_id del primero
+            locals_, media = [], []
+            try:
+                for i, p in enumerate(photos[:10]):
+                    fname = f"img_{hashlib.md5(p.url.encode()).hexdigest()[:8]}.jpg"
+                    lp = await download_image(p.url, fname)
+                    if lp:
+                        locals_.append(lp)
+                        media.append(InputMediaPhoto(
+                            media=open(lp, "rb"),
+                            caption=caption if i == 0 else None,
+                            parse_mode=ParseMode.MARKDOWN if i == 0 else None,
+                        ))
+                if media:
+                    msgs = await bot.send_media_group(chat_id=channel_id, media=media,
+                                                      reply_to_message_id=reply_to)
+                    msg_id = msgs[0].message_id if msgs else None
+            finally:
+                for lp in locals_: _del(lp)
+
+        if msg_id:
+            save_sent_msg_id(tweet.id, msg_id)
+        return msg_id is not None
+
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        return await process_tweet(tweet, channel_id, sport, config, subscribe_msg, use_filter)
+    except TelegramError as e:
+        log.error(f"[TG] Error enviando tweet {tweet.id}: {e}")
+        return False
 
 
 async def _process_group(accounts: dict, channel_id: str, sport: str,
