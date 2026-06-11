@@ -525,7 +525,7 @@ async def send_video_tg(cid: str, tweet: Tweet, caption: str, reply_to: int = No
         _del(path)
 
 async def send_album(cid: str, urls: list, caption: str, reply_to: int = None) -> bool:
-    locals_, media = [], []
+    locals_, media, handles = [], [], []
     try:
         for i, url in enumerate(urls[:10]):
             fname = f"img_{hashlib.md5(url.encode()).hexdigest()[:8]}.jpg"
@@ -534,8 +534,10 @@ async def send_album(cid: str, urls: list, caption: str, reply_to: int = None) -
                 p = await download_image(url.replace(":orig", ""), fname)
             if p:
                 locals_.append(p)
+                fh = open(p, "rb")
+                handles.append(fh)
                 media.append(InputMediaPhoto(
-                    media=open(p, "rb"),
+                    media=fh,
                     caption=caption if i == 0 else None,
                     parse_mode=ParseMode.MARKDOWN if i == 0 else None,
                 ))
@@ -546,8 +548,63 @@ async def send_album(cid: str, urls: list, caption: str, reply_to: int = None) -
     except TelegramError as e:
         log.error(f"[TG] álbum: {e}")
     finally:
+        for fh in handles:
+            try: fh.close()
+            except Exception: pass
         for p in locals_: _del(p)
     return False
+
+# ══════════════════════════════════════════════════════════════════
+#  FILTRO DE ALINEACIONES MLB — UnderdogMLB
+# ══════════════════════════════════════════════════════════════════
+# Patrones que identifican posts de alineaciones MLB de UnderdogMLB.
+# Estos posts tienen un formato muy reconocible: encabezado con el equipo,
+# posiciones (C, 1B, 2B, 3B, SS, LF, CF, RF, DH, SP) y nombres de jugadores.
+_MLB_LINEUP_PATTERNS = [
+    # Encabezado típico: "Starting Lineup" o "Today's Lineup"
+    re.compile(r"(starting|today.?s|tonight.?s)\s+lineup", re.IGNORECASE),
+    # Tres o más posiciones de campo en el mismo tweet
+    re.compile(r"\b(SP|C|1B|2B|3B|SS|LF|CF|RF|DH)\b.*\b(SP|C|1B|2B|3B|SS|LF|CF|RF|DH)\b.*\b(SP|C|1B|2B|3B|SS|LF|CF|RF|DH)\b", re.DOTALL),
+    # Listas numeradas de jugadores con posición (formato típico UnderdogMLB)
+    re.compile(r"^\s*[1-9]\.\s+\w.*\b(CF|LF|RF|SS|2B|3B|1B|DH|C|SP)\b", re.MULTILINE | re.IGNORECASE),
+]
+
+def is_mlb_lineup(text: str) -> bool:
+    """Detecta si un tweet de UnderdogMLB es una alineación de equipo MLB."""
+    for pattern in _MLB_LINEUP_PATTERNS:
+        if pattern.search(text):
+            log.info(f"[FiltroMLB] Alineación detectada — omitiendo: {text[:60]!r}")
+            return True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FILTRO DE LIVESCORE EN VIVO — BarcaUniversal / MadridUniversal
+# ══════════════════════════════════════════════════════════════════
+# Detecta por patrones fijos los tweets de seguimiento minuto a minuto
+# ANTES de gastar una llamada a Groq. Si pasa este filtro, se llama a Groq
+# solo para filtrar contenido irrelevante adicional (apuestas, trivial, etc.)
+_LIVESCORE_PATTERNS = [
+    # Marcador en vivo con minuto: "45' | Barça 1-0 Madrid" o "FT: 2-1"
+    re.compile(r"\b\d{1,3}['′']\s*[|│]", re.IGNORECASE),
+    # Etiquetas explícitas de livescore
+    re.compile(r"\b(LIVE|EN VIVO|MINUTO\s+A\s+MINUTO|DIRECTO|MARCADOR\s+EN\s+VIVO|LIVESCORE)\b", re.IGNORECASE),
+    # Bloque de marcador tipo "Barça 2 - 1 Madrid  ⏱ 67'"
+    re.compile(r"\d\s*[-–]\s*\d.*[⏱🕐🕑🕒⌚]\s*\d{1,3}['′']", re.DOTALL),
+    # Formato "HT:" o "FT:" con marcador numérico seguido de contexto de live
+    re.compile(r"\b(HT|FT)\s*:\s*\d\s*[-–]\s*\d", re.IGNORECASE),
+    # Actualizaciones de minuto: "Min. 34" o "Minuto 78"
+    re.compile(r"\bmin(uto)?\.?\s*\d{1,3}\b", re.IGNORECASE),
+]
+
+def is_livescore_tweet(text: str) -> bool:
+    """Detecta si un tweet es seguimiento en vivo (livescore / minuto a minuto)."""
+    for pattern in _LIVESCORE_PATTERNS:
+        if pattern.search(text):
+            log.info(f"[FiltroLive] Livescore detectado — omitiendo: {text[:60]!r}")
+            return True
+    return False
+
 
 # ══════════════════════════════════════════════════════════════════
 #  FILTRO DE RELEVANCIA (fútbol) — Groq decide
@@ -555,24 +612,32 @@ async def send_album(cid: str, urls: list, caption: str, reply_to: int = None) -
 _FILTER_PROMPT = """Eres un editor de un canal de fútbol profesional. Tu tarea es decidir si un tweet debe publicarse.
 
 PUBLICAR si es:
-- Noticia importante: fichaje, lesión, convocatoria, rueda de prensa, resultado de partido, clasificación
-- Resultado final de un partido
-- Gol, tarjeta roja, estadística destacada de un partido
-- Declaraciones relevantes de un jugador o entrenador
+- Noticia importante: fichaje, traspaso, lesión, convocatoria, rueda de prensa, clasificación de liga/copa
+- Resultado FINAL de un partido (no actualizaciones en vivo)
+- Gol confirmado, tarjeta roja, estadística destacada POST-partido
+- Declaraciones relevantes de un jugador, entrenador o directivo
+- Resumen o highlights de partido ya terminado
 
 NO PUBLICAR si es:
 - Contenido de apuestas, casas de apuestas, pronósticos (Stake, Bet365, Livescore, odds, cuotas…)
-- Seguimiento en vivo / live score / minuto a minuto
-- Contenido irrelevante o curioso (comida de aficionados, estadios vacíos, anécdotas sin importancia)
-- Encuestas o trivial
-- Publicidad o patrocinio
+- Seguimiento en vivo, minuto a minuto, marcador en tiempo real, actualizaciones de partido en curso
+- Contenido irrelevante (comida de aficionados, estadios vacíos, efemérides sin importancia)
+- Encuestas, trivial o entretenimiento sin valor noticioso
+- Publicidad, patrocinio o contenido promocional
 
 Responde ÚNICAMENTE con una sola palabra: PUBLICAR o IGNORAR"""
 
 async def is_relevant_football(text: str) -> bool:
-    """Usa Groq para decidir si un tweet de fútbol es relevante. Devuelve True si debe publicarse."""
+    """Filtra livescore por regex primero (rápido y sin coste), luego Groq para el resto."""
+    # 1. Filtro rápido de livescore sin coste de API
+    if is_livescore_tweet(text):
+        return False
+
+    # 2. Si no hay cliente Groq, publicar todo lo que pasó el filtro de livescore
     if not groq_client:
-        return True  # sin filtro si no hay key
+        return True
+
+    # 3. Groq filtra apuestas, trivial y demás contenido no relevante
     try:
         def _call():
             return groq_client.chat.completions.create(
@@ -618,14 +683,24 @@ async def build_caption(text: str, sport: str, translate_it: bool, subscribe_msg
         body = await translate(body, sport)
     return _truncate(f"{body}\n\n*{subscribe_msg}*")
 
-def should_post_basic(text: str, photos_only: bool, media_types: list) -> bool:
-    """Filtro básico para NBA/MLB (photos_only)."""
-    if not photos_only: return True
-    if "photo" not in media_types: return False
+def should_post_basic(text: str, photos_only: bool, media_types: list,
+                      username: str = "") -> bool:
+    """Filtro básico para NBA/MLB.
+    - Bloquea alineaciones MLB de UnderdogMLB.
+    - Aplica photos_only cuando corresponde.
+    """
+    # Filtro de alineaciones MLB — solo para UnderdogMLB
+    if username == "UnderdogMLB" and is_mlb_lineup(text):
+        return False
+
+    if not photos_only:
+        return True
+    if "photo" not in media_types:
+        return False
     tl = text.lower()
     kw = ["final", "score", "recap", "result", "tonight", "last night",
           "game", "wins", "beats", "defeats", "victory", "walk-off",
-          "highlights", "lineup", "starting"]
+          "highlights", "starting"]
     return any(k in tl for k in kw) or bool(re.search(r'\b\d{1,3}[-–]\d{1,3}\b', text))
 
 # ══════════════════════════════════════════════════════════════════
@@ -635,7 +710,8 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
                         subscribe_msg: str, use_filter: bool = False) -> bool:
     media_types = [m.type for m in tweet.media]
 
-    if not should_post_basic(tweet.text, config.get("photos_only", False), media_types):
+    if not should_post_basic(tweet.text, config.get("photos_only", False), media_types,
+                             username=tweet.author_username):
         return False
 
     if use_filter:
@@ -702,15 +778,17 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
 
         else:
             # Álbum — el message_id del primero
-            locals_, media = [], []
+            locals_, media, handles = [], [], []
             try:
                 for i, p in enumerate(photos[:10]):
                     fname = f"img_{hashlib.md5(p.url.encode()).hexdigest()[:8]}.jpg"
                     lp = await download_image(p.url, fname)
                     if lp:
                         locals_.append(lp)
+                        fh = open(lp, "rb")
+                        handles.append(fh)
                         media.append(InputMediaPhoto(
-                            media=open(lp, "rb"),
+                            media=fh,
                             caption=caption if i == 0 else None,
                             parse_mode=ParseMode.MARKDOWN if i == 0 else None,
                         ))
@@ -719,6 +797,9 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
                                                       reply_to_message_id=reply_to)
                     msg_id = msgs[0].message_id if msgs else None
             finally:
+                for fh in handles:
+                    try: fh.close()
+                    except Exception: pass
                 for lp in locals_: _del(lp)
 
         if msg_id:
@@ -763,8 +844,8 @@ async def run_cycle():
 
     tasks += await _process_group(NBA_ACCOUNTS,    NBA_CHANNEL_ID,    "nba",     NBA_SUBSCRIBE)
     tasks += await _process_group(MLB_ACCOUNTS,    MLB_CHANNEL_ID,    "mlb",     MLB_SUBSCRIBE)
-    tasks += await _process_group(BARCA_ACCOUNTS,  BARCA_CHANNEL_ID,  "futbol",  BARCA_SUBSCRIBE,  use_filter=False)
-    tasks += await _process_group(MADRID_ACCOUNTS, MADRID_CHANNEL_ID, "futbol",  MADRID_SUBSCRIBE, use_filter=False)
+    tasks += await _process_group(BARCA_ACCOUNTS,  BARCA_CHANNEL_ID,  "futbol",  BARCA_SUBSCRIBE,  use_filter=True)
+    tasks += await _process_group(MADRID_ACCOUNTS, MADRID_CHANNEL_ID, "futbol",  MADRID_SUBSCRIBE, use_filter=True)
     tasks += await _process_group(PREMIER_ACCOUNTS,PREMIER_CHANNEL_ID,"premier", PREMIER_SUBSCRIBE,use_filter=True)
 
     if not tasks:
