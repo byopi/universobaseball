@@ -251,11 +251,18 @@ async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) ->
     random.shuffle(instances)
     for base in instances:
         try:
-            resp = await asyncio.get_event_loop().run_in_executor(
-                None, lambda u=f"{base}/{username}/rss": requests.get(u, headers={"User-Agent": "SportsBot/1.0"}, timeout=10)
+            rss_url = f"{base}/{username}/rss"
+            # IMPORTANTE: pasarle la URL (string) a feedparser, NO los bytes ya
+            # descargados con requests. Cuando feedparser conoce la URL base,
+            # resuelve internamente los src="/pic/pbs.twimg.com%2F..." relativos
+            # de Nitter a URLs absolutas y descargables. Si se le pasan bytes
+            # crudos (sin URL base) esos src quedan rotos y nunca se publican
+            # las fotos/videos — este era el bug.
+            feed = await asyncio.get_event_loop().run_in_executor(
+                None, lambda u=rss_url: feedparser.parse(u, agent="Mozilla/5.0", request_headers={"User-Agent": "Mozilla/5.0"})
             )
-            if resp.status_code != 200: continue
-            feed = feedparser.parse(resp.content)
+            if feed.bozo and not feed.entries:
+                continue
             if not feed.entries: continue
 
             tweets = []
@@ -278,16 +285,32 @@ async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) ->
                 text = re.sub(r"@(\w+)", r"\1", text)
                 if not text or text.startswith("RT "): continue
 
-                # Nitter no nos da videos directos, pero sí la URL del tweet
                 xurl = re.sub(r'https://(nitter\.net|xcancel\.com|nitter\.cz)/', 'https://x.com/', link)
                 media = []
                 for img in soup.find_all("img"):
                     src = img.get("src", "")
-                    if src and src.startswith("http") and "pbs.twimg.com" in src:
+                    if not src:
+                        continue
+                    # Tras la resolución de feedparser, src ya debería ser absoluto:
+                    #   https://nitter.net/pic/pbs.twimg.com%2Fmedia%2F...   (proxy, válido para descargar)
+                    #   https://pbs.twimg.com/media/...                      (directo, también válido)
+                    if not src.startswith("http"):
+                        # Por si alguna instancia no resolvió la URL, intentamos a mano
+                        src = base.rstrip("/") + "/" + src.lstrip("/")
+                    if "pbs.twimg.com" not in src and "/pic/" not in src:
+                        continue
+
+                    # Si la <img> está dentro de un <a href=".../video/N">, es video
+                    parent_a = img.find_parent("a")
+                    if parent_a and "/video/" in parent_a.get("href", ""):
+                        media.append(TweetMedia(type="video", url=src))
+                    else:
                         media.append(TweetMedia(type="photo", url=src))
-                # Marcar que puede tener video (lo descargaremos por tweet_url)
-                has_video_hint = any(x in entry.get("description","") for x in ["video", "gif"])
-                if has_video_hint and not media:
+
+                # Si no captamos ningún medio pero la descripción sugiere video/gif,
+                # marcar para que get_video() intente yt-dlp con tweet_url
+                has_video_hint = any(x in entry.get("description", "").lower() for x in ["/video/", "animated_gif"])
+                if has_video_hint and not any(m.type == "video" for m in media):
                     media.append(TweetMedia(type="video", url=""))
 
                 tweets.append(Tweet(
