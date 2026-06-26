@@ -11,9 +11,10 @@ from bs4 import BeautifulSoup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from telegram import Bot, InputMediaPhoto, InputMediaVideo
+from telegram import Bot, InputMediaPhoto, InputMediaVideo, Update
 from telegram.error import TelegramError, RetryAfter
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,16 +30,19 @@ MLB_CHANNEL_ID         = os.getenv("MLB_CHANNEL_ID", "")
 BARCA_CHANNEL_ID       = os.getenv("BARCA_CHANNEL_ID", "")
 MADRID_CHANNEL_ID      = os.getenv("MADRID_CHANNEL_ID", "")
 PREMIER_CHANNEL_ID     = os.getenv("PREMIER_CHANNEL_ID", "")
+FICHAJES_CHANNEL_ID    = os.getenv("FICHAJES_CHANNEL_ID", "")
 GROQ_API_KEY           = os.getenv("GROQ_API_KEY", "")
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
 MAX_VIDEO_SIZE_BYTES   = int(os.getenv("MAX_VIDEO_SIZE_MB", "50")) * 1024 * 1024
 PORT                   = int(os.getenv("PORT", "8080"))
+ADMIN_TELEGRAM_ID      = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 
-NBA_SUBSCRIBE     = "📲 Suscríbete en t.me/NBA_Latinoamerica"
-MLB_SUBSCRIBE     = "📲 Suscríbete en t.me/UniversoBaseball"
-BARCA_SUBSCRIBE   = "📲 Suscríbete en t.me/BarcaZoneES"
-MADRID_SUBSCRIBE  = "📲 Suscríbete en t.me/MadridZoneES"
-PREMIER_SUBSCRIBE = "📲 Suscríbete en t.me/PremierLeague_ES"
+NBA_SUBSCRIBE      = "📲 Suscríbete en t.me/NBA_Latinoamerica"
+MLB_SUBSCRIBE      = "📲 Suscríbete en t.me/UniversoBaseball"
+BARCA_SUBSCRIBE    = "📲 Suscríbete en t.me/BarcaNewsES"
+MADRID_SUBSCRIBE   = "📲 Suscríbete en t.me/RMNewa_ES"
+PREMIER_SUBSCRIBE  = "📲 Suscríbete en t.me/PremierLeague_ES"
+FICHAJES_SUBSCRIBE = "📲 Suscríbete en t.me/FichajesDeFutbol"
 
 # ── Cuentas por deporte ───────────────────────────────────────────
 NBA_ACCOUNTS = {
@@ -58,6 +62,20 @@ MADRID_ACCOUNTS = {
 PREMIER_ACCOUNTS = {
     "Mercado_Ingles": {"translate": False, "photos_only": False},
 }
+FICHAJES_ACCOUNTS = {
+    "mercatosphera": {"translate": True, "photos_only": False},
+}
+
+# ── Grupos registrados para los comandos /scan y /accounts ────────
+# (nombre legible, dict de cuentas, channel_id, sport, subscribe_msg, use_filter)
+GROUPS = [
+    ("NBA",       NBA_ACCOUNTS,       "NBA_CHANNEL_ID",      "nba",      NBA_SUBSCRIBE,      False),
+    ("MLB",       MLB_ACCOUNTS,       "MLB_CHANNEL_ID",      "mlb",      MLB_SUBSCRIBE,       False),
+    ("Barça",     BARCA_ACCOUNTS,     "BARCA_CHANNEL_ID",    "futbol",   BARCA_SUBSCRIBE,     True),
+    ("Madrid",    MADRID_ACCOUNTS,    "MADRID_CHANNEL_ID",   "futbol",   MADRID_SUBSCRIBE,    True),
+    ("Premier",   PREMIER_ACCOUNTS,   "PREMIER_CHANNEL_ID",  "premier",  PREMIER_SUBSCRIBE,   True),
+    ("Fichajes",  FICHAJES_ACCOUNTS,  "FICHAJES_CHANNEL_ID", "futbol",   FICHAJES_SUBSCRIBE,  True),
+]
 
 NITTER_INSTANCES = [
     "https://nitter.net",
@@ -340,9 +358,46 @@ REGLAS:
 5. Si ya está en español, devuélvelo SIN cambios.
 6. Solo la traducción. Sin comillas ni explicaciones."""
 
-async def translate(text: str, sport: str) -> str:
+# Frases que indican que el modelo se negó a traducir o se confundió de contexto
+# (p.ej. el bug de contexto NBA/MLB/fútbol cruzado) en vez de dar la traducción real.
+_REFUSAL_PATTERNS = [
+    re.compile(r"no\s+hay\s+texto", re.IGNORECASE),
+    re.compile(r"no\s+se\s+proporcion[oó]\s+texto", re.IGNORECASE),
+    re.compile(r"parece\s+ser\s+sobre", re.IGNORECASE),
+    re.compile(r"estar[ée]\s+encantad[oa]\s+de\s+ayudar", re.IGNORECASE),
+    re.compile(r"no\s+puedo\s+traducir", re.IGNORECASE),
+    re.compile(r"como\s+(modelo|asistente|ia)\s+de\s+lenguaje", re.IGNORECASE),
+    re.compile(r"lo\s+siento,?\s+(pero\s+)?no", re.IGNORECASE),
+    re.compile(r"si\s+(se\s+)?(proporciona|proporcionas|me\s+proporcionas)", re.IGNORECASE),
+]
+
+def _looks_like_refusal(original: str, result: str) -> bool:
+    """Detecta si la 'traducción' es en realidad una negativa/disculpa del modelo
+    en lugar del texto traducido (p.ej. por confundir el contexto deportivo)."""
+    if not result.strip():
+        return True
+    # Una traducción real debería tener una longitud comparable al original.
+    # Una negativa suele ser mucho más corta que el post real (salvo posts muy breves).
+    if len(original) > 60 and len(result) < len(original) * 0.35:
+        return True
+    for pattern in _REFUSAL_PATTERNS:
+        if pattern.search(result):
+            return True
+    return False
+
+async def translate(text: str, sport: str, _attempt: int = 1, _max_attempts: int = 3) -> str:
     if not text.strip() or not groq_client: return text
-    ctx = "béisbol (MLB)" if sport == "mlb" else ("fútbol (La Liga)" if sport == "football" else "baloncesto (NBA)")
+    if sport == "mlb":
+        ctx = "béisbol (MLB)"
+    elif sport in ("football", "futbol", "fútbol", "soccer"):
+        ctx = "fútbol (La Liga / Champions League)"
+    elif sport == "premier":
+        ctx = "fútbol (Premier League)"
+    elif sport == "nba":
+        ctx = "baloncesto (NBA)"
+    else:
+        ctx = "deportes en general"
+
     try:
         def _call():
             return groq_client.chat.completions.create(
@@ -355,10 +410,24 @@ async def translate(text: str, sport: str) -> str:
             )
         resp = await asyncio.get_event_loop().run_in_executor(None, _call)
         result = resp.choices[0].message.content.strip().strip("\"'")
-        log.info(f"[Groq] ✅ Traducido")
+
+        if _looks_like_refusal(text, result):
+            if _attempt < _max_attempts:
+                log.warning(f"[Groq] ⚠️ Respuesta no parece traducción (intento {_attempt}/{_max_attempts}) — reintentando: {result[:80]!r}")
+                await asyncio.sleep(1.5 * _attempt)  # backoff progresivo
+                return await translate(text, sport, _attempt=_attempt + 1, _max_attempts=_max_attempts)
+            log.warning(f"[Groq] ❌ Tras {_max_attempts} intentos sigue sin traducir bien — usando texto original")
+            return text
+
+        log.info(f"[Groq] ✅ Traducido" + (f" (intento {_attempt})" if _attempt > 1 else ""))
         return result
     except Exception as e:
-        log.warning(f"[Groq] Error: {e}"); return text
+        if _attempt < _max_attempts:
+            log.warning(f"[Groq] ⚠️ Error (intento {_attempt}/{_max_attempts}): {e} — reintentando")
+            await asyncio.sleep(1.5 * _attempt)
+            return await translate(text, sport, _attempt=_attempt + 1, _max_attempts=_max_attempts)
+        log.warning(f"[Groq] ❌ Error tras {_max_attempts} intentos: {e} — usando texto original")
+        return text
 
 # ══════════════════════════════════════════════════════════════════
 #  DESCARGA DE VIDEO — yt-dlp desde x.com
@@ -865,11 +934,11 @@ async def run_cycle():
     log.info("[Bot] 🔄 Ciclo iniciado")
     tasks = []
 
-    tasks += await _process_group(NBA_ACCOUNTS,    NBA_CHANNEL_ID,    "nba",     NBA_SUBSCRIBE)
-    tasks += await _process_group(MLB_ACCOUNTS,    MLB_CHANNEL_ID,    "mlb",     MLB_SUBSCRIBE)
-    tasks += await _process_group(BARCA_ACCOUNTS,  BARCA_CHANNEL_ID,  "futbol",  BARCA_SUBSCRIBE,  use_filter=True)
-    tasks += await _process_group(MADRID_ACCOUNTS, MADRID_CHANNEL_ID, "futbol",  MADRID_SUBSCRIBE, use_filter=True)
-    tasks += await _process_group(PREMIER_ACCOUNTS,PREMIER_CHANNEL_ID,"premier", PREMIER_SUBSCRIBE,use_filter=True)
+    for name, accounts, channel_env, sport, sub_msg, use_filter in GROUPS:
+        channel_id = globals()[channel_env]
+        if not channel_id:
+            continue
+        tasks += await _process_group(accounts, channel_id, sport, sub_msg, use_filter=use_filter)
 
     if not tasks:
         log.info("[Bot] Sin tweets nuevos."); return
@@ -889,6 +958,112 @@ async def run_cycle():
     log.info("[Bot] ✅ Ciclo completado.")
 
 # ══════════════════════════════════════════════════════════════════
+#  COMANDOS DE TELEGRAM
+# ══════════════════════════════════════════════════════════════════
+_scheduler_ref = {"scheduler": None}  # se asigna en main()
+
+def _parse_interval(text: str) -> Optional[int]:
+    """Convierte '5m', '30m', '1h', '90s' o un número plano (minutos) a minutos.
+    Devuelve None si no se pudo interpretar."""
+    text = text.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*(m|min|minuto|minutos)?", text)
+    if m:
+        return int(m.group(1))
+    m = re.fullmatch(r"(\d+)\s*(h|hr|hora|horas)", text)
+    if m:
+        return int(m.group(1)) * 60
+    m = re.fullmatch(r"(\d+)\s*(s|seg|segundo|segundos)", text)
+    if m:
+        # apscheduler trabaja en minutos en este bot; redondeamos hacia arriba a 1 min mínimo
+        secs = int(m.group(1))
+        return max(1, round(secs / 60))
+    return None
+
+def _is_admin(update: Update) -> bool:
+    if not ADMIN_TELEGRAM_ID:
+        return True  # si no se configuró admin, cualquiera puede usar los comandos
+    return bool(update.effective_user) and update.effective_user.id == ADMIN_TELEGRAM_ID
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🤖 *Sports Telegram Bot*\n\n"
+        "Este bot lee, traduce (cuando aplica) y publica posts de X/Twitter "
+        "en los canales configurados, junto con sus fotos/videos.\n\n"
+        "*Comandos disponibles:*\n\n"
+        "📡 `/scan` — Fuerza un escaneo inmediato de todas las cuentas.\n"
+        "⏱ `/scan 5m` — Cambia el intervalo automático a 5 minutos.\n"
+        "⏱ `/scan 30m` — Cambia el intervalo automático a 30 minutos.\n"
+        "⏱ `/scan 1h` — Cambia el intervalo automático a 1 hora.\n"
+        "   _(acepta minutos `m`, horas `h` o un número plano = minutos)_\n\n"
+        "📋 `/accounts` — Lista todas las cuentas de X y a qué canal de "
+        "Telegram publica cada una.\n\n"
+        "ℹ️ `/status` — Estado actual del bot (ciclos corridos, intervalo, etc).\n\n"
+        "❓ `/start` — Muestra este mensaje de ayuda."
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["📋 *Cuentas configuradas:*\n"]
+    for name, accounts, channel_env, sport, sub_msg, use_filter in GROUPS:
+        channel_id = globals()[channel_env]
+        estado = channel_id if channel_id else "⚠️ sin canal configurado"
+        lines.append(f"\n*{name}* → `{estado}`")
+        for username in accounts:
+            lines.append(f"   • @{username}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = _state
+    await update.message.reply_text(
+        f"📊 *Estado del bot*\n\n"
+        f"Estado: `{s['status']}`\n"
+        f"Iniciado: `{s['started_at']}`\n"
+        f"Ciclos completados: `{s['cycles']}`\n"
+        f"Último ciclo: `{s['last_cycle']}`\n"
+        f"Intervalo actual: `{CHECK_INTERVAL_MINUTES} min`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CHECK_INTERVAL_MINUTES
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ No tienes permiso para usar este comando.")
+        return
+
+    args = context.args  # lista de argumentos después de /scan
+
+    if not args:
+        # Sin argumentos -> forzar escaneo inmediato
+        await update.message.reply_text("🔎 Escaneando todas las cuentas ahora...")
+        await bot_cycle()
+        await update.message.reply_text(
+            f"✅ Escaneo completado. Próximo automático en {CHECK_INTERVAL_MINUTES} min."
+        )
+        return
+
+    # Con argumento -> reprogramar el intervalo, ej: /scan 30m  /scan 1h  /scan 5
+    new_minutes = _parse_interval(args[0])
+    if new_minutes is None or new_minutes <= 0:
+        await update.message.reply_text(
+            "❌ Formato inválido. Usa algo como:\n`/scan 5m`, `/scan 30m`, `/scan 1h`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    scheduler = _scheduler_ref["scheduler"]
+    if scheduler is None:
+        await update.message.reply_text("❌ El scheduler aún no está disponible.")
+        return
+
+    scheduler.reschedule_job("cycle", trigger=IntervalTrigger(minutes=new_minutes))
+    CHECK_INTERVAL_MINUTES = new_minutes
+    await update.message.reply_text(
+        f"⏱ Intervalo de escaneo actualizado a *{new_minutes} min*.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    log.info(f"[Bot] Intervalo reprogramado a {new_minutes} min vía /scan")
+
+# ══════════════════════════════════════════════════════════════════
 #  HTTP + MAIN
 # ══════════════════════════════════════════════════════════════════
 _state = {"started_at": None, "cycles": 0, "last_cycle": None, "status": "starting"}
@@ -899,7 +1074,7 @@ async def handle_status(req):
         text=json.dumps({**_state, "interval_min": CHECK_INTERVAL_MINUTES,
                          "nba": NBA_CHANNEL_ID, "mlb": MLB_CHANNEL_ID,
                          "barca": BARCA_CHANNEL_ID, "madrid": MADRID_CHANNEL_ID,
-                         "premier": PREMIER_CHANNEL_ID}, indent=2),
+                         "premier": PREMIER_CHANNEL_ID, "fichajes": FICHAJES_CHANNEL_ID}, indent=2),
         content_type="application/json")
 
 async def bot_cycle():
@@ -919,13 +1094,15 @@ async def main():
     log.info("╔══════════════════════════════════════════╗")
     log.info("║  🏀⚾⚽ SPORTS TELEGRAM BOT ⚽⚾🏀      ║")
     log.info("╚══════════════════════════════════════════╝")
-    log.info(f"NBA:     {NBA_CHANNEL_ID}")
-    log.info(f"MLB:     {MLB_CHANNEL_ID}")
-    log.info(f"Barça:   {BARCA_CHANNEL_ID}")
-    log.info(f"Madrid:  {MADRID_CHANNEL_ID}")
-    log.info(f"Premier: {PREMIER_CHANNEL_ID}")
-    log.info(f"Groq:    {'✅' if groq_client else '⚠️ sin key'}")
+    log.info(f"NBA:      {NBA_CHANNEL_ID}")
+    log.info(f"MLB:      {MLB_CHANNEL_ID}")
+    log.info(f"Barça:    {BARCA_CHANNEL_ID}")
+    log.info(f"Madrid:   {MADRID_CHANNEL_ID}")
+    log.info(f"Premier:  {PREMIER_CHANNEL_ID}")
+    log.info(f"Fichajes: {FICHAJES_CHANNEL_ID}")
+    log.info(f"Groq:     {'✅' if groq_client else '⚠️ sin key'}")
 
+    # ── Servidor HTTP (health/status para Render) ──────────────────
     app = web.Application()
     app.router.add_get("/", handle_status)
     app.router.add_get("/health", handle_health)
@@ -935,16 +1112,34 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info(f"Web:      ✅ 0.0.0.0:{PORT}")
 
+    # ── Bot de Telegram con comandos (/start, /scan, /accounts, /status) ──
+    tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("scan", cmd_scan))
+    tg_app.add_handler(CommandHandler("accounts", cmd_accounts))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
+    log.info("Telegram: ✅ comandos /start /scan /accounts /status activos")
+
+    # ── Primer ciclo inmediato ───────────────────────────────────────
     await bot_cycle()
 
+    # ── Scheduler de ciclos automáticos ─────────────────────────────
     scheduler = AsyncIOScheduler()
     scheduler.add_job(bot_cycle, IntervalTrigger(minutes=CHECK_INTERVAL_MINUTES),
                       id="cycle", replace_existing=True, max_instances=1)
     scheduler.start()
+    _scheduler_ref["scheduler"] = scheduler
     log.info(f"Scheduler: cada {CHECK_INTERVAL_MINUTES} min")
 
     loop = asyncio.get_running_loop()
-    def _stop(sig): scheduler.shutdown(wait=False); loop.stop()
+    def _stop(sig):
+        scheduler.shutdown(wait=False)
+        asyncio.ensure_future(tg_app.updater.stop())
+        asyncio.ensure_future(tg_app.stop())
+        loop.stop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _stop, sig.name)
 
