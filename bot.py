@@ -39,10 +39,10 @@ ADMIN_TELEGRAM_ID      = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 
 NBA_SUBSCRIBE      = "📲 Suscríbete en t.me/NBA_Latinoamerica"
 MLB_SUBSCRIBE      = "📲 Suscríbete en t.me/UniversoBaseball"
-BARCA_SUBSCRIBE    = "📲 Suscríbete en t.me/BarcaNewsES"
-MADRID_SUBSCRIBE   = "📲 Suscríbete en t.me/RMNewa_ES"
+BARCA_SUBSCRIBE    = "📲 Suscríbete en t.me/barcanewses"
+MADRID_SUBSCRIBE   = "📲 Suscríbete en t.me/rmnews_es"
 PREMIER_SUBSCRIBE  = "📲 Suscríbete en t.me/PremierLeague_ES"
-FICHAJES_SUBSCRIBE = "📲 Suscríbete en t.me/FichajesDeFutbol"
+FICHAJES_SUBSCRIBE = "📲 Suscríbete en t.me/fichajesdefutbol"
 
 # ── Cuentas por deporte ───────────────────────────────────────────
 NBA_ACCOUNTS = {
@@ -157,6 +157,15 @@ class Tweet:
     tweet_url: str = ""
     quoted_tweet_id: str = ""   # ID del tweet citado (si lo hay)
 
+def tweet_id_to_timestamp(tweet_id: str) -> Optional[float]:
+    """Decodifica el timestamp (epoch segundos) embebido en un ID de tweet (Snowflake)."""
+    try:
+        tid = int(tweet_id)
+        ts_ms = (tid >> 22) + 1288834974657
+        return ts_ms / 1000
+    except (ValueError, TypeError):
+        return None
+
 def _parse_syndication(html: str, username: str) -> List[Tweet]:
     """Extrae tweets del HTML de la Syndication API de Twitter."""
     match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
@@ -191,7 +200,8 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
 
             text = tweet.get("full_text", tweet.get("text", ""))
             text = re.sub(r"https?://t\.co/\S+", "", text).strip()
-            text = re.sub(r"@(\w+)", r"\1", text)
+            # Las menciones (@usuario) se dejan tal cual están en el tweet original,
+            # pegadas sin espacio extra — no se eliminan ni se separan.
 
             # Detectar si es un tweet citado
             quoted_tweet_id = ""
@@ -300,7 +310,7 @@ async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) ->
                 lines = [l.strip() for l in text.splitlines()]
                 text = "\n".join(l for l in lines if l)
                 text = re.sub(r"https?://t\.co/\S+", "", text).strip()
-                text = re.sub(r"@(\w+)", r"\1", text)
+                # Las menciones (@usuario) se dejan tal cual, pegadas sin espacio extra.
                 if not text or text.startswith("RT "): continue
 
                 xurl = re.sub(r'https://(nitter\.net|xcancel\.com|nitter\.cz)/', 'https://x.com/', link)
@@ -769,7 +779,135 @@ def save_sent_msg_id(tweet_id: str, msg_id: int):
 def _truncate(text: str, max_len: int = 1024) -> str:
     return text if len(text) <= max_len else text[:max_len - 3] + "..."
 
-async def build_caption(text: str, sport: str, translate_it: bool, subscribe_msg: str) -> str:
+# ══════════════════════════════════════════════════════════════════
+#  FORMATO ESPECIAL — mercatosphera (FichajesDeFutbol)
+# ══════════════════════════════════════════════════════════════════
+# La cuenta mercatosphera publica casi siempre fichajes oficiales o retiros.
+# En vez de traducir el tweet tal cual, se reescribe con un formato fijo:
+#
+#   🚨🇦🇹 | OFICIAL: <Jugador> es nuevo jugador del <Club destino>
+#
+#   ▫️ Llega procedente del <Club origen>, firma hasta <año> con los <gentilicio>.
+#
+#   📲 Suscríbete en t.me/FichajesDeFutbol
+#
+# Para retiros:
+#   🚨🏁 | OFICIAL: <Jugador> anuncia su retiro del fútbol profesional
+#
+#   ▫️ Pone fin a su carrera tras su paso por el <Club/Selección>.
+#
+#   📲 Suscríbete en t.me/FichajesDeFutbol
+
+_TRANSFER_EXTRACT_PROMPT = """Eres un editor de un canal de fichajes de fútbol. Analiza el tweet y \
+extrae los datos en JSON puro (sin texto extra, sin markdown, sin explicación).
+
+Si es un FICHAJE/TRASPASO OFICIAL, responde:
+{
+  "tipo": "fichaje",
+  "jugador": "<nombre del jugador>",
+  "club_destino": "<nombre del club al que se une>",
+  "club_origen": "<club del que llega, o \\"\\" si no se menciona>",
+  "duracion": "<ej. 'hasta 2031', 'por una temporada', '' si no se menciona>",
+  "gentilicio_destino": "<gentilicio plural del país/ciudad del club destino, ej. 'austriacos', 'ingleses', 'españoles', 'merengues' — usa algo natural y reconocible>",
+  "pais_emoji_destino": "<emoji de bandera del país del club destino, ej. 🇦🇹>"
+}
+
+Si es un RETIRO, responde:
+{
+  "tipo": "retiro",
+  "jugador": "<nombre del jugador>",
+  "club_o_seleccion": "<último club o selección relevante, o \\"\\" si no se menciona>"
+}
+
+Si el tweet NO es un fichaje oficial ni un retiro (rumor, especulación, otra noticia), responde:
+{"tipo": "otro"}
+
+Responde ÚNICAMENTE el JSON, nada más."""
+
+async def _extract_transfer_data(text: str) -> Optional[dict]:
+    if not groq_client:
+        return None
+    try:
+        def _call():
+            return groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": _TRANSFER_EXTRACT_PROMPT},
+                    {"role": "user", "content": text[:800]},
+                ],
+                temperature=0.0, max_tokens=300,
+            )
+        resp = await asyncio.get_event_loop().run_in_executor(None, _call)
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        return data
+    except Exception as e:
+        log.warning(f"[Mercatosphera] No se pudo extraer datos estructurados: {e}")
+        return None
+
+def _format_transfer(data: dict) -> Optional[str]:
+    jugador = (data.get("jugador") or "").strip()
+    if not jugador:
+        return None
+
+    if data.get("tipo") == "fichaje":
+        club_destino = (data.get("club_destino") or "").strip()
+        if not club_destino:
+            return None
+        club_origen  = (data.get("club_origen") or "").strip()
+        duracion     = (data.get("duracion") or "").strip()
+        gentilicio   = (data.get("gentilicio_destino") or "").strip()
+        bandera      = (data.get("pais_emoji_destino") or "").strip()
+
+        header = f"🚨{bandera} | *OFICIAL: {jugador} es nuevo jugador del {club_destino}*"
+
+        detalle_parts = []
+        if club_origen:
+            detalle_parts.append(f"Llega procedente del {club_origen}")
+        else:
+            detalle_parts.append("Llega como nuevo refuerzo")
+        if duracion:
+            detalle_parts.append(f"firma {duracion}" + (f" con los {gentilicio}" if gentilicio else ""))
+        elif gentilicio:
+            detalle_parts.append(f"se une a los {gentilicio}")
+        detalle = ", ".join(detalle_parts) + "."
+        body = f"▫️ {detalle}"
+
+        return f"{header}\n\n{body}"
+
+    elif data.get("tipo") == "retiro":
+        club = (data.get("club_o_seleccion") or "").strip()
+        header = f"🚨🏁 | *OFICIAL: {jugador} anuncia su retiro del fútbol profesional*"
+        if club:
+            body = f"▫️ Pone fin a su carrera tras su paso por el {club}."
+        else:
+            body = "▫️ Pone fin a su carrera como futbolista profesional."
+        return f"{header}\n\n{body}"
+
+    return None
+
+async def build_mercatosphera_caption(text: str, subscribe_msg: str) -> Optional[str]:
+    """Intenta reformatear un tweet de mercatosphera como fichaje/retiro.
+    Devuelve None si no aplica (no es fichaje/retiro), para que el caller
+    use el formato genérico (traducción normal) como respaldo."""
+    data = await _extract_transfer_data(text)
+    if not data or data.get("tipo") not in ("fichaje", "retiro"):
+        return None
+    formatted = _format_transfer(data)
+    if not formatted:
+        return None
+    return _truncate(f"{formatted}\n\n*{subscribe_msg}*")
+
+async def build_caption(text: str, sport: str, translate_it: bool, subscribe_msg: str,
+                        username: str = "") -> str:
+    # Estilo directo especial para mercatosphera: fichajes y retiros con formato fijo.
+    if username == "mercatosphera":
+        special = await build_mercatosphera_caption(text, subscribe_msg)
+        if special:
+            return special
+        # Si no es fichaje/retiro reconocible, cae al formato genérico de abajo.
+
     body = text
     if translate_it:
         body = await translate(body, sport)
@@ -810,7 +948,8 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
         if not await is_relevant_football(tweet.text):
             return False
 
-    caption = await build_caption(tweet.text, sport, config.get("translate", False), subscribe_msg)
+    caption = await build_caption(tweet.text, sport, config.get("translate", False), subscribe_msg,
+                                  username=tweet.author_username)
     photos  = [m for m in tweet.media if m.type == "photo"]
     videos  = [m for m in tweet.media if m.type == "video"]
 
@@ -907,10 +1046,35 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
 
 
 async def _process_group(accounts: dict, channel_id: str, sport: str,
-                          subscribe_msg: str, use_filter: bool = False) -> list:
-    """Obtiene tweets de un grupo de cuentas y devuelve tareas pendientes."""
+                          subscribe_msg: str, use_filter: bool = False,
+                          max_age_minutes: Optional[int] = None) -> list:
+    """Obtiene tweets de un grupo de cuentas y devuelve tareas pendientes.
+
+    Si max_age_minutes está definido, solo se consideran tweets publicados
+    dentro de esa ventana de tiempo (usado por /scan 5m, /scan 30m, etc),
+    ignorando por completo el since_id guardado — útil para re-escanear
+    una ventana reciente bajo demanda sin tocar el estado normal del bot.
+    """
     tasks = []
+    cutoff_ts = None
+    if max_age_minutes is not None:
+        cutoff_ts = time.time() - max_age_minutes * 60
+
     for username, config in accounts.items():
+        if max_age_minutes is not None:
+            # Escaneo manual por ventana de tiempo: ignoramos since_id,
+            # traemos los tweets recientes de la cuenta y filtramos por edad.
+            tweets = await fetch_tweets_syndication(username, since_id=None)
+            fresh = []
+            for t in tweets:
+                ts = tweet_id_to_timestamp(t.id)
+                if ts is not None and ts >= cutoff_ts:
+                    fresh.append(t)
+            for t in reversed(fresh):
+                if not is_processed(t.id):
+                    tasks.append((t, channel_id, sport, config, username, subscribe_msg, use_filter))
+            continue
+
         since_id = get_last_id(username)
         tweets = await fetch_tweets_syndication(username, since_id=since_id)
 
@@ -930,32 +1094,41 @@ async def _process_group(accounts: dict, channel_id: str, sport: str,
     return tasks
 
 
-async def run_cycle():
-    log.info("[Bot] 🔄 Ciclo iniciado")
+async def run_cycle(max_age_minutes: Optional[int] = None) -> int:
+    log.info("[Bot] 🔄 Ciclo iniciado" + (f" (ventana: últimos {max_age_minutes} min)" if max_age_minutes else ""))
     tasks = []
 
     for name, accounts, channel_env, sport, sub_msg, use_filter in GROUPS:
         channel_id = globals()[channel_env]
         if not channel_id:
             continue
-        tasks += await _process_group(accounts, channel_id, sport, sub_msg, use_filter=use_filter)
+        tasks += await _process_group(accounts, channel_id, sport, sub_msg,
+                                      use_filter=use_filter, max_age_minutes=max_age_minutes)
 
     if not tasks:
-        log.info("[Bot] Sin tweets nuevos."); return
+        log.info("[Bot] Sin tweets nuevos."); return 0
 
     log.info(f"[Bot] Procesando {len(tasks)} tweets...")
+    published = 0
     for tweet, channel, sport, config, username, sub_msg, use_filter in tasks:
         try:
             ok = await process_tweet(tweet, channel, sport, config, sub_msg, use_filter)
             mark_processed(tweet.id)
-            set_last_id(username, tweet.id)
+            # En escaneo por ventana de tiempo no movemos el since_id hacia atrás,
+            # solo lo actualizamos si el tweet es más nuevo que el guardado.
+            current_last = get_last_id(username)
+            if current_last is None or int(tweet.id) > int(current_last):
+                set_last_id(username, tweet.id)
+            if ok:
+                published += 1
             log.info(f"[Bot] {'✅' if ok else '⏭'} [{sport.upper()}] @{username}/{tweet.id}")
             await asyncio.sleep(3)
         except Exception as e:
             log.error(f"[Bot] ❌ {tweet.id}: {e}")
 
     cleanup_old()
-    log.info("[Bot] ✅ Ciclo completado.")
+    log.info(f"[Bot] ✅ Ciclo completado. Publicados: {published}/{len(tasks)}")
+    return published
 
 # ══════════════════════════════════════════════════════════════════
 #  COMANDOS DE TELEGRAM
@@ -990,11 +1163,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Este bot lee, traduce (cuando aplica) y publica posts de X/Twitter "
         "en los canales configurados, junto con sus fotos/videos.\n\n"
         "*Comandos disponibles:*\n\n"
-        "📡 `/scan` — Fuerza un escaneo inmediato de todas las cuentas.\n"
-        "⏱ `/scan 5m` — Cambia el intervalo automático a 5 minutos.\n"
-        "⏱ `/scan 30m` — Cambia el intervalo automático a 30 minutos.\n"
-        "⏱ `/scan 1h` — Cambia el intervalo automático a 1 hora.\n"
+        "📡 `/scan` — Escanea ahora todo lo pendiente (sin filtrar por tiempo).\n"
+        "📡 `/scan 5m` — Escanea solo lo publicado en los últimos 5 minutos.\n"
+        "📡 `/scan 30m` — Escanea solo lo publicado en los últimos 30 minutos.\n"
+        "📡 `/scan 1h` — Escanea solo lo publicado en la última hora.\n"
         "   _(acepta minutos `m`, horas `h` o un número plano = minutos)_\n\n"
+        "⏱ `/interval` — Muestra cada cuánto corre el escaneo automático.\n"
+        "⏱ `/interval 5m` / `30m` / `1h` — Cambia ese intervalo automático.\n\n"
         "📋 `/accounts` — Lista todas las cuentas de X y a qué canal de "
         "Telegram publica cada una.\n\n"
         "ℹ️ `/status` — Estado actual del bot (ciclos corridos, intervalo, etc).\n\n"
@@ -1025,27 +1200,73 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /scan           -> escanea TODO lo nuevo desde el último tweet visto por cuenta.
+    /scan 5m        -> escanea solo tweets publicados en los últimos 5 minutos.
+    /scan 30m       -> escanea solo tweets publicados en los últimos 30 minutos.
+    /scan 1h        -> escanea solo tweets publicados en la última hora.
+    No afecta el intervalo automático — para eso usa /interval.
+    """
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ No tienes permiso para usar este comando.")
+        return
+
+    args = context.args
+    max_age_minutes = None
+
+    if args:
+        max_age_minutes = _parse_interval(args[0])
+        if max_age_minutes is None or max_age_minutes <= 0:
+            await update.message.reply_text(
+                "❌ Formato inválido. Usa algo como:\n`/scan 5m`, `/scan 30m`, `/scan 1h`\n\n"
+                "O usa `/scan` sin argumentos para escanear todo lo pendiente.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        aviso = f"🔎 Escaneando publicaciones de los últimos *{args[0]}*..."
+    else:
+        aviso = "🔎 Escaneando todas las cuentas (todo lo pendiente)..."
+
+    await update.message.reply_text(aviso, parse_mode=ParseMode.MARKDOWN)
+
+    # Se ejecuta como tarea en segundo plano para no bloquear el loop de eventos
+    # (y así el bot sigue respondiendo a otros comandos mientras escanea).
+    async def _run():
+        try:
+            published = await bot_cycle(max_age_minutes=max_age_minutes)
+            ventana_txt = f" en los últimos {args[0]}" if args else ""
+            await update.message.reply_text(
+                f"✅ Escaneo completado{ventana_txt}. Publicados: {published} post(s)."
+            )
+        except Exception as e:
+            log.error(f"[Bot] ❌ Error en /scan: {e}")
+            await update.message.reply_text(f"❌ Error durante el escaneo: {e}")
+
+    asyncio.create_task(_run())
+
+async def cmd_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /interval 5m / 30m / 1h -> cambia cada cuánto corre el ciclo AUTOMÁTICO.
+    /interval               -> muestra el intervalo actual.
+    """
     global CHECK_INTERVAL_MINUTES
     if not _is_admin(update):
         await update.message.reply_text("⛔ No tienes permiso para usar este comando.")
         return
 
-    args = context.args  # lista de argumentos después de /scan
-
+    args = context.args
     if not args:
-        # Sin argumentos -> forzar escaneo inmediato
-        await update.message.reply_text("🔎 Escaneando todas las cuentas ahora...")
-        await bot_cycle()
         await update.message.reply_text(
-            f"✅ Escaneo completado. Próximo automático en {CHECK_INTERVAL_MINUTES} min."
+            f"⏱ Intervalo automático actual: *{CHECK_INTERVAL_MINUTES} min*\n\n"
+            f"Para cambiarlo: `/interval 5m`, `/interval 30m`, `/interval 1h`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # Con argumento -> reprogramar el intervalo, ej: /scan 30m  /scan 1h  /scan 5
     new_minutes = _parse_interval(args[0])
     if new_minutes is None or new_minutes <= 0:
         await update.message.reply_text(
-            "❌ Formato inválido. Usa algo como:\n`/scan 5m`, `/scan 30m`, `/scan 1h`",
+            "❌ Formato inválido. Usa algo como:\n`/interval 5m`, `/interval 30m`, `/interval 1h`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -1058,10 +1279,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scheduler.reschedule_job("cycle", trigger=IntervalTrigger(minutes=new_minutes))
     CHECK_INTERVAL_MINUTES = new_minutes
     await update.message.reply_text(
-        f"⏱ Intervalo de escaneo actualizado a *{new_minutes} min*.",
+        f"⏱ Intervalo automático actualizado a *{new_minutes} min*.",
         parse_mode=ParseMode.MARKDOWN
     )
-    log.info(f"[Bot] Intervalo reprogramado a {new_minutes} min vía /scan")
+    log.info(f"[Bot] Intervalo automático reprogramado a {new_minutes} min vía /interval")
 
 # ══════════════════════════════════════════════════════════════════
 #  HTTP + MAIN
@@ -1077,15 +1298,17 @@ async def handle_status(req):
                          "premier": PREMIER_CHANNEL_ID, "fichajes": FICHAJES_CHANNEL_ID}, indent=2),
         content_type="application/json")
 
-async def bot_cycle():
+async def bot_cycle(max_age_minutes: Optional[int] = None) -> int:
     try:
         _state["status"] = "running"
-        await run_cycle()
+        published = await run_cycle(max_age_minutes=max_age_minutes)
         _state["cycles"] += 1
         _state["last_cycle"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         _state["status"] = "idle"
+        return published
     except Exception as e:
         _state["status"] = "error"; log.error(f"[Bot] ❌ {e}")
+        return 0
 
 async def main():
     _load_state()
@@ -1112,19 +1335,25 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info(f"Web:      ✅ 0.0.0.0:{PORT}")
 
-    # ── Bot de Telegram con comandos (/start, /scan, /accounts, /status) ──
+    # ── Bot de Telegram con comandos (/start, /scan, /interval, /accounts, /status) ──
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("scan", cmd_scan))
+    tg_app.add_handler(CommandHandler("interval", cmd_interval))
     tg_app.add_handler(CommandHandler("accounts", cmd_accounts))
     tg_app.add_handler(CommandHandler("status", cmd_status))
     await tg_app.initialize()
     await tg_app.start()
     await tg_app.updater.start_polling(drop_pending_updates=True)
-    log.info("Telegram: ✅ comandos /start /scan /accounts /status activos")
+    log.info("Telegram: ✅ comandos /start /scan /interval /accounts /status activos")
 
-    # ── Primer ciclo inmediato ───────────────────────────────────────
-    await bot_cycle()
+    # ── Primer ciclo en segundo plano ───────────────────────────────
+    # IMPORTANTE: no se usa "await" aquí. Si se espera (await bot_cycle())
+    # el loop de eventos queda ocupado todo el tiempo que tarda el primer
+    # escaneo (descargas de fotos/videos, llamadas a Groq, etc) y el polling
+    # de Telegram no recibe tiempo de CPU para procesar comandos como
+    # /accounts o /scan durante ese rato — por eso parecía no responder.
+    asyncio.create_task(bot_cycle())
 
     # ── Scheduler de ciclos automáticos ─────────────────────────────
     scheduler = AsyncIOScheduler()
