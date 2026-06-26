@@ -1047,13 +1047,18 @@ async def process_tweet(tweet: Tweet, channel_id: str, sport: str, config: dict,
 
 async def _process_group(accounts: dict, channel_id: str, sport: str,
                           subscribe_msg: str, use_filter: bool = False,
-                          max_age_minutes: Optional[int] = None) -> list:
+                          max_age_minutes: Optional[int] = None,
+                          force_reprocess: bool = False) -> list:
     """Obtiene tweets de un grupo de cuentas y devuelve tareas pendientes.
 
     Si max_age_minutes está definido, solo se consideran tweets publicados
     dentro de esa ventana de tiempo (usado por /scan 5m, /scan 30m, etc),
-    ignorando por completo el since_id guardado — útil para re-escanear
-    una ventana reciente bajo demanda sin tocar el estado normal del bot.
+    ignorando el since_id guardado — útil para re-escanear una ventana
+    reciente bajo demanda sin tocar el estado normal del bot.
+
+    force_reprocess=True además ignora is_processed, es decir, vuelve a
+    publicar tweets de esa ventana aunque ya se hayan publicado antes
+    (usado por /scan Xm force). Por defecto es False para no duplicar posts.
     """
     tasks = []
     cutoff_ts = None
@@ -1071,7 +1076,7 @@ async def _process_group(accounts: dict, channel_id: str, sport: str,
                 if ts is not None and ts >= cutoff_ts:
                     fresh.append(t)
             for t in reversed(fresh):
-                if not is_processed(t.id):
+                if force_reprocess or not is_processed(t.id):
                     tasks.append((t, channel_id, sport, config, username, subscribe_msg, use_filter))
             continue
 
@@ -1094,8 +1099,8 @@ async def _process_group(accounts: dict, channel_id: str, sport: str,
     return tasks
 
 
-async def run_cycle(max_age_minutes: Optional[int] = None) -> int:
-    log.info("[Bot] 🔄 Ciclo iniciado" + (f" (ventana: últimos {max_age_minutes} min)" if max_age_minutes else ""))
+async def run_cycle(max_age_minutes: Optional[int] = None, force_reprocess: bool = False) -> int:
+    log.info("[Bot] 🔄 Ciclo iniciado" + (f" (ventana: últimos {max_age_minutes} min{', forzado' if force_reprocess else ''})" if max_age_minutes else ""))
     tasks = []
 
     for name, accounts, channel_env, sport, sub_msg, use_filter in GROUPS:
@@ -1103,7 +1108,8 @@ async def run_cycle(max_age_minutes: Optional[int] = None) -> int:
         if not channel_id:
             continue
         tasks += await _process_group(accounts, channel_id, sport, sub_msg,
-                                      use_filter=use_filter, max_age_minutes=max_age_minutes)
+                                      use_filter=use_filter, max_age_minutes=max_age_minutes,
+                                      force_reprocess=force_reprocess)
 
     if not tasks:
         log.info("[Bot] Sin tweets nuevos."); return 0
@@ -1157,6 +1163,22 @@ def _is_admin(update: Update) -> bool:
         return True  # si no se configuró admin, cualquiera puede usar los comandos
     return bool(update.effective_user) and update.effective_user.id == ADMIN_TELEGRAM_ID
 
+async def _safe_reply(update: Update, text: str, parse_mode=ParseMode.MARKDOWN):
+    """Responde con Markdown, pero si Telegram rechaza el parseo (p.ej. por un
+    guión bajo suelto en un username como Mercado_Ingles, que el Markdown
+    legacy interpreta como cursiva sin cerrar), reintenta en texto plano en
+    vez de fallar en silencio. Sin esto, un comando podía "no responder"
+    sin dejar rastro visible para el usuario."""
+    try:
+        await update.message.reply_text(text, parse_mode=parse_mode)
+    except TelegramError as e:
+        log.warning(f"[Telegram] Falló el parseo de Markdown ({e}) — reintentando en texto plano")
+        plain = re.sub(r"[*_`\[\]]", "", text)
+        try:
+            await update.message.reply_text(plain)
+        except TelegramError as e2:
+            log.error(f"[Telegram] No se pudo enviar ni en texto plano: {e2}")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 *Sports Telegram Bot*\n\n"
@@ -1175,7 +1197,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ `/status` — Estado actual del bot (ciclos corridos, intervalo, etc).\n\n"
         "❓ `/start` — Muestra este mensaje de ayuda."
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await _safe_reply(update, text)
 
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *Cuentas configuradas:*\n"]
@@ -1184,63 +1206,80 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         estado = channel_id if channel_id else "⚠️ sin canal configurado"
         lines.append(f"\n*{name}* → `{estado}`")
         for username in accounts:
-            lines.append(f"   • @{username}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+            # Escapamos guiones bajos (ej. Mercado_Ingles) para que el Markdown
+            # legacy de Telegram no los interprete como apertura de cursiva sin
+            # cerrar — eso hacía que el mensaje completo fuera rechazado por la
+            # API y el comando pareciera "no responder".
+            safe_username = username.replace("_", "\\_")
+            lines.append(f"   • @{safe_username}")
+    await _safe_reply(update, "\n".join(lines))
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = _state
-    await update.message.reply_text(
+    await _safe_reply(
+        update,
         f"📊 *Estado del bot*\n\n"
         f"Estado: `{s['status']}`\n"
         f"Iniciado: `{s['started_at']}`\n"
         f"Ciclos completados: `{s['cycles']}`\n"
         f"Último ciclo: `{s['last_cycle']}`\n"
-        f"Intervalo actual: `{CHECK_INTERVAL_MINUTES} min`",
-        parse_mode=ParseMode.MARKDOWN
+        f"Intervalo actual: `{CHECK_INTERVAL_MINUTES} min`"
     )
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /scan           -> escanea TODO lo nuevo desde el último tweet visto por cuenta.
-    /scan 5m        -> escanea solo tweets publicados en los últimos 5 minutos.
-    /scan 30m       -> escanea solo tweets publicados en los últimos 30 minutos.
-    /scan 1h        -> escanea solo tweets publicados en la última hora.
+    /scan               -> escanea TODO lo nuevo desde el último tweet visto por cuenta.
+    /scan 5m            -> escanea solo tweets publicados en los últimos 5 minutos
+                           (que aún no se hayan publicado antes).
+    /scan 30m           -> ídem con los últimos 30 minutos.
+    /scan 1h            -> ídem con la última hora.
+    /scan 1h force      -> ídem pero IGNORA si ya se publicó antes — vuelve a
+                           publicar todo lo que haya en esa ventana de tiempo.
+                           Útil para verificar/forzar reenvíos de prueba.
     No afecta el intervalo automático — para eso usa /interval.
     """
     if not _is_admin(update):
-        await update.message.reply_text("⛔ No tienes permiso para usar este comando.")
+        await _safe_reply(update, "⛔ No tienes permiso para usar este comando.", parse_mode=None)
         return
 
     args = context.args
     max_age_minutes = None
+    force_reprocess = False
 
     if args:
+        if args[0].lower() in ("force", "forzar") and len(args) == 1:
+            await _safe_reply(update, "❌ `/scan force` necesita una ventana de tiempo, ej:\n`/scan 1h force`")
+            return
+
         max_age_minutes = _parse_interval(args[0])
         if max_age_minutes is None or max_age_minutes <= 0:
-            await update.message.reply_text(
-                "❌ Formato inválido. Usa algo como:\n`/scan 5m`, `/scan 30m`, `/scan 1h`\n\n"
-                "O usa `/scan` sin argumentos para escanear todo lo pendiente.",
-                parse_mode=ParseMode.MARKDOWN
+            await _safe_reply(
+                update,
+                "❌ Formato inválido. Usa algo como:\n`/scan 5m`, `/scan 30m`, `/scan 1h`, `/scan 1h force`\n\n"
+                "O usa `/scan` sin argumentos para escanear todo lo pendiente."
             )
             return
-        aviso = f"🔎 Escaneando publicaciones de los últimos *{args[0]}*..."
+
+        if len(args) > 1 and args[1].lower() in ("force", "forzar"):
+            force_reprocess = True
+
+        aviso = f"🔎 Escaneando publicaciones de los últimos *{args[0]}*"
+        aviso += " (modo forzado, puede duplicar posts ya enviados)..." if force_reprocess else "..."
     else:
         aviso = "🔎 Escaneando todas las cuentas (todo lo pendiente)..."
 
-    await update.message.reply_text(aviso, parse_mode=ParseMode.MARKDOWN)
+    await _safe_reply(update, aviso)
 
     # Se ejecuta como tarea en segundo plano para no bloquear el loop de eventos
     # (y así el bot sigue respondiendo a otros comandos mientras escanea).
     async def _run():
         try:
-            published = await bot_cycle(max_age_minutes=max_age_minutes)
+            published = await bot_cycle(max_age_minutes=max_age_minutes, force_reprocess=force_reprocess)
             ventana_txt = f" en los últimos {args[0]}" if args else ""
-            await update.message.reply_text(
-                f"✅ Escaneo completado{ventana_txt}. Publicados: {published} post(s)."
-            )
+            await _safe_reply(update, f"✅ Escaneo completado{ventana_txt}. Publicados: {published} post(s).", parse_mode=None)
         except Exception as e:
             log.error(f"[Bot] ❌ Error en /scan: {e}")
-            await update.message.reply_text(f"❌ Error durante el escaneo: {e}")
+            await _safe_reply(update, f"❌ Error durante el escaneo: {e}", parse_mode=None)
 
     asyncio.create_task(_run())
 
@@ -1251,37 +1290,31 @@ async def cmd_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     global CHECK_INTERVAL_MINUTES
     if not _is_admin(update):
-        await update.message.reply_text("⛔ No tienes permiso para usar este comando.")
+        await _safe_reply(update, "⛔ No tienes permiso para usar este comando.", parse_mode=None)
         return
 
     args = context.args
     if not args:
-        await update.message.reply_text(
+        await _safe_reply(
+            update,
             f"⏱ Intervalo automático actual: *{CHECK_INTERVAL_MINUTES} min*\n\n"
-            f"Para cambiarlo: `/interval 5m`, `/interval 30m`, `/interval 1h`",
-            parse_mode=ParseMode.MARKDOWN
+            f"Para cambiarlo: `/interval 5m`, `/interval 30m`, `/interval 1h`"
         )
         return
 
     new_minutes = _parse_interval(args[0])
     if new_minutes is None or new_minutes <= 0:
-        await update.message.reply_text(
-            "❌ Formato inválido. Usa algo como:\n`/interval 5m`, `/interval 30m`, `/interval 1h`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await _safe_reply(update, "❌ Formato inválido. Usa algo como:\n`/interval 5m`, `/interval 30m`, `/interval 1h`")
         return
 
     scheduler = _scheduler_ref["scheduler"]
     if scheduler is None:
-        await update.message.reply_text("❌ El scheduler aún no está disponible.")
+        await _safe_reply(update, "❌ El scheduler aún no está disponible.", parse_mode=None)
         return
 
     scheduler.reschedule_job("cycle", trigger=IntervalTrigger(minutes=new_minutes))
     CHECK_INTERVAL_MINUTES = new_minutes
-    await update.message.reply_text(
-        f"⏱ Intervalo automático actualizado a *{new_minutes} min*.",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await _safe_reply(update, f"⏱ Intervalo automático actualizado a *{new_minutes} min*.")
     log.info(f"[Bot] Intervalo automático reprogramado a {new_minutes} min vía /interval")
 
 # ══════════════════════════════════════════════════════════════════
@@ -1298,10 +1331,10 @@ async def handle_status(req):
                          "premier": PREMIER_CHANNEL_ID, "fichajes": FICHAJES_CHANNEL_ID}, indent=2),
         content_type="application/json")
 
-async def bot_cycle(max_age_minutes: Optional[int] = None) -> int:
+async def bot_cycle(max_age_minutes: Optional[int] = None, force_reprocess: bool = False) -> int:
     try:
         _state["status"] = "running"
-        published = await run_cycle(max_age_minutes=max_age_minutes)
+        published = await run_cycle(max_age_minutes=max_age_minutes, force_reprocess=force_reprocess)
         _state["cycles"] += 1
         _state["last_cycle"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         _state["status"] = "idle"
