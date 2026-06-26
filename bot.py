@@ -39,8 +39,8 @@ ADMIN_TELEGRAM_ID      = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 
 NBA_SUBSCRIBE      = "📲 Suscríbete en t.me/NBA_Latinoamerica"
 MLB_SUBSCRIBE      = "📲 Suscríbete en t.me/UniversoBaseball"
-BARCA_SUBSCRIBE    = "📲 Suscríbete en t.me/barcanewses"
-MADRID_SUBSCRIBE   = "📲 Suscríbete en t.me/rmnews_es"
+BARCA_SUBSCRIBE    = "» #FCB | #ForçaBarça\n\n📲 Suscríbete en t.me/BarcaNewsES"
+MADRID_SUBSCRIBE   = "» #RMA | #HalaMadrid\n\n📲 Suscríbete en t.me/RMNews_ES"
 PREMIER_SUBSCRIBE  = "📲 Suscríbete en t.me/PremierLeague_ES"
 FICHAJES_SUBSCRIBE = "📲 Suscríbete en t.me/fichajesdefutbol"
 
@@ -216,6 +216,15 @@ def _parse_syndication(html: str, username: str) -> List[Tweet]:
             entities  = tweet.get("entities", {}).get("media", [])
             all_media = extended or entities
 
+            # Si el tweet principal no trae media propia pero SÍ cita a otro
+            # tweet, el video/foto suele estar en el tweet citado (esto es lo
+            # que generaba el bug de quedar como texto "Video" sin descargar
+            # nada: el código nunca miraba dentro de quoted_status).
+            if not all_media and quoted:
+                q_extended = quoted.get("extended_entities", {}).get("media", [])
+                q_entities = quoted.get("entities", {}).get("media", [])
+                all_media = q_extended or q_entities
+
             for m in all_media:
                 mtype = m.get("type", "")
                 if mtype == "photo":
@@ -328,10 +337,17 @@ async def _fetch_tweets_nitter(username: str, since_id: Optional[str] = None) ->
                     if "pbs.twimg.com" not in src and "/pic/" not in src:
                         continue
 
-                    # Si la <img> está dentro de un <a href=".../video/N">, es video
+                    # Si la <img> está dentro de un <a href=".../video/N">, es video.
+                    # IMPORTANTE: ese <img> es solo el THUMBNAIL del video (un JPG),
+                    # nunca el archivo de video real. Si se guarda como "url" del
+                    # TweetMedia, download_video_from_url() lo descarga creyendo que
+                    # es un .mp4 y termina enviando una imagen renombrada como video
+                    # (Telegram la rechaza y el post se pierde o queda sin medio).
+                    # Por eso se guarda en thumb_url y se deja url="" para forzar
+                    # que get_video() use yt-dlp, que sí trae el video real.
                     parent_a = img.find_parent("a")
                     if parent_a and "/video/" in parent_a.get("href", ""):
-                        media.append(TweetMedia(type="video", url=src))
+                        media.append(TweetMedia(type="video", url="", thumb_url=src))
                     else:
                         media.append(TweetMedia(type="photo", url=src))
 
@@ -363,9 +379,18 @@ _SYSTEM = """Eres un traductor experto en deportes. Traduce del inglés al espa�
 REGLAS:
 1. NO traduzcas nombres de jugadores, equipos ni clubes.
 2. NO traduzcas abreviaciones (pts, reb, ast, ERA, RBI, HR, SP, DH, 1B, 2B, 3B, SS, CF, RF, LF, C…).
-3. NO traduzcas hashtags ni menciones.
-4. PRESERVA el formato exacto: saltos de línea, listas, espacios.
-5. Si ya está en español, devuélvelo SIN cambios.
+3. NO traduzcas hashtags ni menciones (@usuario).
+4. PRESERVA el formato EXACTO del original, carácter por carácter en cuanto a estructura:
+   - Si el original tiene una línea vacía entre dos párrafos, tu traducción debe tener
+     esa MISMA línea vacía en el mismo lugar. No la elimines ni la conviertas en un solo salto.
+   - Si el original termina con una firma o atribución en su propia línea, separada por una
+     línea vacía (ej. un guion seguido de una mención, como "—  @usuario" en su propia línea),
+     tu traducción DEBE mantener esa línea de firma exactamente igual, en su propia línea,
+     con la misma línea vacía antes de ella. NUNCA la pegues al párrafo anterior.
+   - No colapses, uses ni "normalices" los saltos de línea. Copia la cantidad exacta de
+     saltos de línea del original en cada lugar.
+   - Conserva listas, viñetas y sangrías tal cual.
+5. Si ya está en español, devuélvelo SIN cambios (ni siquiera de formato).
 6. Solo la traducción. Sin comillas ni explicaciones."""
 
 # Frases que indican que el modelo se negó a traducir o se confundió de contexto
@@ -394,6 +419,46 @@ def _looks_like_refusal(original: str, result: str) -> bool:
         if pattern.search(result):
             return True
     return False
+
+def _fix_signature_spacing(original: str, translated: str) -> str:
+    """Garantiza que una línea (o bloque de 2 líneas) de firma/atribución al
+    final (ej. '—  @usuario' en una línea, o '—' y '@usuario' en dos líneas
+    separadas, que es como a veces lo deja el LLM) quede separada del resto
+    del post por una línea vacía, igual que en el original. Los modelos a
+    veces 'normalizan' el texto y pegan la firma al párrafo anterior aunque
+    se les pida explícitamente no hacerlo — esto corrige el resultado sin
+    depender 100% de que el LLM obedezca la instrucción del prompt."""
+    dash_only = re.compile(r"^[—\-–]\s*$")
+    dash_with_mention = re.compile(r"^[—\-–]\s*@?\w[\w\s.]*$")
+    mention_only = re.compile(r"^@\w+$")
+
+    def find_sig_block(lines):
+        idx = len(lines) - 1
+        while idx >= 0 and not lines[idx].strip():
+            idx -= 1
+        if idx < 0:
+            return None, None
+        if dash_with_mention.match(lines[idx].strip()):
+            sig_start = idx
+        elif mention_only.match(lines[idx].strip()) and idx >= 1 and dash_only.match(lines[idx - 1].strip()):
+            sig_start = idx - 1
+        else:
+            return None, None
+        blank_before = sig_start >= 1 and not lines[sig_start - 1].strip()
+        return sig_start, blank_before
+
+    orig_lines = original.split("\n")
+    _, orig_has_blank = find_sig_block(orig_lines)
+    if not orig_has_blank:
+        return translated
+
+    trans_lines = translated.split("\n")
+    sig_start, trans_has_blank = find_sig_block(trans_lines)
+    if sig_start is None or trans_has_blank:
+        return translated
+
+    trans_lines.insert(sig_start, "")
+    return "\n".join(trans_lines)
 
 async def translate(text: str, sport: str, _attempt: int = 1, _max_attempts: int = 3) -> str:
     if not text.strip() or not groq_client: return text
@@ -430,6 +495,7 @@ async def translate(text: str, sport: str, _attempt: int = 1, _max_attempts: int
             return text
 
         log.info(f"[Groq] ✅ Traducido" + (f" (intento {_attempt})" if _attempt > 1 else ""))
+        result = _fix_signature_spacing(text, result)
         return result
     except Exception as e:
         if _attempt < _max_attempts:
@@ -779,6 +845,33 @@ def save_sent_msg_id(tweet_id: str, msg_id: int):
 def _truncate(text: str, max_len: int = 1024) -> str:
     return text if len(text) <= max_len else text[:max_len - 3] + "..."
 
+def _escape_mention_underscores(text: str) -> str:
+    """Escapa los guiones bajos DENTRO de menciones (@usuario_con_guion) para
+    que el Markdown legacy de Telegram no los interprete como apertura de
+    cursiva sin cierre. Sin esto, una sola mención con guion bajo (ej.
+    @Mercado_Ingles) podía hacer que Telegram rechazara el envío de TODO el
+    post al canal, perdiéndolo en silencio — riesgo mayor ahora que todo el
+    cuerpo del post se envuelve en negrita."""
+    def _escape(m):
+        return "@" + m.group(1).replace("_", "\\_")
+    return re.sub(r"@(\w+)", _escape, text)
+
+def _wrap_bold_preserving_lines(text: str) -> str:
+    """Envuelve el texto en negrita preservando saltos de línea exactos
+    (incluyendo líneas vacías entre párrafos/firmas, como '— @usuario').
+    Se envuelve cada línea no vacía por separado en vez de todo el bloque
+    de una sola vez, así una línea vacía no corta accidentalmente la negrita
+    a la mitad del texto en el render de Telegram."""
+    text = _escape_mention_underscores(text)
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        if line.strip():
+            out.append(f"*{line}*")
+        else:
+            out.append("")
+    return "\n".join(out)
+
 # ══════════════════════════════════════════════════════════════════
 #  FORMATO ESPECIAL — mercatosphera (FichajesDeFutbol)
 # ══════════════════════════════════════════════════════════════════
@@ -911,7 +1004,14 @@ async def build_caption(text: str, sport: str, translate_it: bool, subscribe_msg
     body = text
     if translate_it:
         body = await translate(body, sport)
-    return _truncate(f"{body}\n\n*{subscribe_msg}*")
+    # Todo el post se publica en negrita (excepto el formato fijo de mercatosphera,
+    # que ya define su propio negrita por bloque arriba). El subscribe_msg puede
+    # ser multilínea (ej. Barça/Madrid con hashtag + línea vacía + suscripción),
+    # así que se envuelve igual que el cuerpo para que cada línea quede en negrita
+    # correctamente sin que una línea vacía rompa el render en Telegram.
+    bold_body = _wrap_bold_preserving_lines(body)
+    bold_subscribe = _wrap_bold_preserving_lines(subscribe_msg)
+    return _truncate(f"{bold_body}\n\n{bold_subscribe}")
 
 def should_post_basic(text: str, photos_only: bool, media_types: list,
                       username: str = "") -> bool:
@@ -1075,6 +1175,20 @@ async def _process_group(accounts: dict, channel_id: str, sport: str,
                 ts = tweet_id_to_timestamp(t.id)
                 if ts is not None and ts >= cutoff_ts:
                     fresh.append(t)
+
+            if tweets and not fresh:
+                # Diagnóstico: mostramos qué tan viejo es el tweet más reciente
+                # traído, para distinguir "no hay nada nuevo" de "la ventana es
+                # muy corta para lo que la fuente (Nitter/Synd) trae".
+                newest = max(tweets, key=lambda t: int(t.id))
+                ts_newest = tweet_id_to_timestamp(newest.id)
+                if ts_newest is not None:
+                    age_min = (time.time() - ts_newest) / 60
+                    log.info(f"[Scan] @{username}: {len(tweets)} tweets traídos, ninguno dentro de "
+                            f"{max_age_minutes}min — el más reciente tiene {age_min:.0f} min de antigüedad")
+            elif fresh:
+                log.info(f"[Scan] @{username}: {len(fresh)}/{len(tweets)} tweets dentro de la ventana de {max_age_minutes}min")
+
             for t in reversed(fresh):
                 if force_reprocess or not is_processed(t.id):
                     tasks.append((t, channel_id, sport, config, username, subscribe_msg, use_filter))
